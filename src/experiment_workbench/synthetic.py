@@ -56,6 +56,7 @@ from experiment_workbench.model import (
     SyntheticMotion,
     SyntheticSourceRecord,
     SyntheticTrialRecord,
+    TimeUnit,
 )
 from experiment_workbench.validation import FloatArray
 
@@ -234,7 +235,7 @@ class SyntheticDataGenerator:
         return SyntheticSourceRecord(
             relpath=f"{trial_dir.name}/{HIGH_RATE_FILE_NAME}",
             time_column="time_s",
-            time_unit="s",
+            time_unit=TimeUnit.SECOND,
             nominal_rate_hz=rate,
             n_rows=frame.height,
             column_units={
@@ -325,7 +326,7 @@ class SyntheticDataGenerator:
         return SyntheticSourceRecord(
             relpath=f"{trial_dir.name}/{LOW_RATE_FILE_NAME}",
             time_column="time_ms",
-            time_unit="ms",
+            time_unit=TimeUnit.MILLISECOND,
             nominal_rate_hz=rate,
             n_rows=frame.height,
             column_units={

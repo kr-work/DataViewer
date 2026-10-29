@@ -1,4 +1,8 @@
-"""プロジェクトフォルダ（SPEC §5.3）の作成・オープン。
+"""プロジェクトフォルダ（SPEC §5.3）の作成・オープンと、フォルダ内のファイルの読み書き。
+
+元データのコピー（originals/）、正規化データ（datasets/ の Parquet）、表示設定（views/）の
+読み書きもここで行う。DB に触れないメソッド（ファイルの読み書き）は、
+ワーカースレッドからも呼べる。
 
 フォルダ構成::
 
@@ -17,16 +21,34 @@
 このモジュールは Qt に依存しない。
 """
 
+import hashlib
+import io
 import json
+import re
 from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
 
+import numpy as np
+import polars as pl
 from pydantic import ValidationError
 
-from experiment_workbench.model import PROJECT_FORMAT_VERSION, Project
+from experiment_workbench.model import (
+    DATASET_TIME_COLUMN,
+    PROJECT_FORMAT_VERSION,
+    VIEW_FORMAT_VERSION,
+    Channel,
+    ChannelData,
+    PlotView,
+    Project,
+    Source,
+)
 from experiment_workbench.storage.database import MetadataDatabase, SchemaVersionError, StorageError
-from experiment_workbench.validation import validate_relative_posix_path
+from experiment_workbench.validation import VIEW_NAME_PATTERN, validate_relative_posix_path
+
+# ファイルのハッシュを計算するときに一度に読む大きさ [byte]。
+# 大きなファイルでもメモリを使いすぎないため。
+_HASH_CHUNK_BYTES = 1024 * 1024
 
 PROJECT_FILE_NAME = "project.json"
 METADATA_DB_NAME = "metadata.sqlite"
@@ -175,6 +197,148 @@ class ProjectStore:
             raise ValueError(f"プロジェクトフォルダの外を指すパスです: {relpath!r}")
         return path
 
+    # --- 元データ・正規化データ ------------------------------------------------
+
+    def write_original(self, relpath: str, data: bytes) -> str:
+        """元ファイルの内容を originals/ 以下に書き込み、保存されたファイルの SHA-256 を返す。
+
+        既存のファイルは上書きしない。書き込み後に保存されたファイルを読み直してハッシュを
+        計算するので、呼び出し側は元の内容のハッシュと比べてコピーの完全性を確認できる。
+
+        Args:
+            relpath: 書き込み先の相対パス（originals/ 以下）。
+            data: 元ファイルの内容。
+
+        Returns:
+            保存されたファイルの SHA-256（16 進小文字）。
+
+        Raises:
+            FileExistsError: 書き込み先が既に存在する場合。
+        """
+        _write_bytes_atomically(self.resolve(relpath), data, overwrite=False)
+        return self.file_sha256(relpath)
+
+    def write_dataset(self, relpath: str, frame: pl.DataFrame) -> None:
+        """正規化データを Parquet として datasets/ 以下に書き込む。
+
+        Args:
+            relpath: 書き込み先の相対パス（datasets/ 以下）。
+            frame: 書き込む表（先頭が時刻列 ``time_s``、残りがチャンネル）。
+
+        Raises:
+            FileExistsError: 書き込み先が既に存在する場合（正規化データも上書きしない）。
+        """
+        buffer = io.BytesIO()
+        frame.write_parquet(buffer)
+        _write_bytes_atomically(self.resolve(relpath), buffer.getvalue(), overwrite=False)
+
+    def file_sha256(self, relpath: str) -> str:
+        """プロジェクト内のファイルの SHA-256 を計算する。
+
+        Args:
+            relpath: ファイルの相対パス。
+
+        Returns:
+            SHA-256（16 進小文字）。
+        """
+        digest = hashlib.sha256()
+        with self.resolve(relpath).open("rb") as file:
+            while chunk := file.read(_HASH_CHUNK_BYTES):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def remove_file(self, relpath: str) -> None:
+        """取り込みに失敗したときに、書きかけのファイルを削除する。
+
+        ファイルを置いていたディレクトリ（originals/<Source ID>/ など）が空になった場合は、
+        それも削除する。プロジェクト直下のサブディレクトリ自体は削除しない。
+
+        Args:
+            relpath: 削除するファイルの相対パス。存在しなくてもよい。
+        """
+        path = self.resolve(relpath)
+        path.unlink(missing_ok=True)
+        parent = path.parent
+        top_level = {self.directory(kind) for kind in ProjectDirectory}
+        if parent not in top_level and parent.is_dir() and not any(parent.iterdir()):
+            parent.rmdir()
+
+    def read_channel_data(self, source: Source, channel: Channel) -> ChannelData:
+        """正規化データから 1 チャンネル分の時刻と値を読み込む。
+
+        Args:
+            source: チャンネルが属する Source。
+            channel: 読み込むチャンネル。
+
+        Returns:
+            時刻 [s] と値（欠損は NaN）。
+
+        Raises:
+            ProjectStoreError: 正規化データのファイルや列が見つからない場合。
+        """
+        try:
+            frame = pl.read_parquet(
+                self.resolve(source.dataset_relpath), columns=[DATASET_TIME_COLUMN, channel.name]
+            )
+        except (OSError, pl.exceptions.PolarsError) as exc:
+            raise ProjectStoreError(
+                f"正規化データを読み込めません"
+                f"（{source.dataset_relpath}、列 {channel.name!r}）: {exc}"
+            ) from exc
+        # Float64 の欠損（null）は to_numpy で NaN になる。
+        return ChannelData(
+            channel=channel,
+            source=source,
+            time_s=frame[DATASET_TIME_COLUMN].to_numpy().astype(np.float64),
+            values=frame[channel.name].to_numpy().astype(np.float64),
+        )
+
+    # --- 表示設定 ------------------------------------------------------------
+
+    def save_view(self, view: PlotView) -> None:
+        """表示設定を views/<名前>.json に保存する（同名のファイルは置き換える）。
+
+        Args:
+            view: 保存する表示設定。
+        """
+        path = self.directory(ProjectDirectory.VIEWS) / f"{view.name}.json"
+        data = (view.model_dump_json(indent=2) + "\n").encode("utf-8")
+        _write_bytes_atomically(path, data, overwrite=True)
+
+    def load_view(self, name: str = "main") -> PlotView | None:
+        """表示設定を読み込む。
+
+        Args:
+            name: 表示設定の名前（英数字・"_"・"-" のみ）。
+
+        Returns:
+            表示設定。保存されていなければ None。
+
+        Raises:
+            ValueError: 名前に使えない文字が含まれる場合（パスの指定を防ぐため）。
+            SchemaVersionError: このアプリより新しい形式で保存されている場合。
+            ProjectStoreError: ファイルの内容が不正な場合。
+        """
+        if not re.fullmatch(VIEW_NAME_PATTERN, name):
+            raise ValueError(f"表示設定の名前に使えない文字が含まれています: {name!r}")
+        path = self.directory(ProjectDirectory.VIEWS) / f"{name}.json"
+        if not path.is_file():
+            return None
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ProjectStoreError(f"{path} を JSON として読み込めません: {exc}") from exc
+        version = raw.get("format_version") if isinstance(raw, dict) else None
+        if isinstance(version, int) and version > VIEW_FORMAT_VERSION:
+            raise SchemaVersionError(
+                f"{path} の形式バージョン {version} は、このアプリが扱えるバージョン "
+                f"{VIEW_FORMAT_VERSION} より新しいため開けません"
+            )
+        try:
+            return PlotView.model_validate(raw)
+        except ValidationError as exc:
+            raise ProjectStoreError(f"{path} の内容が不正です:\n{exc}") from exc
+
     # --- 接続管理 ------------------------------------------------------------
 
     def close(self) -> None:
@@ -220,9 +384,26 @@ def _write_project_file(root: Path, project: Project) -> None:
         root: プロジェクトフォルダ。
         project: 書き込む内容。
     """
-    path = root / PROJECT_FILE_NAME
-    tmp_path = path.with_name(f"{PROJECT_FILE_NAME}.tmp")
-    tmp_path.write_text(project.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    data = (project.model_dump_json(indent=2) + "\n").encode("utf-8")
+    _write_bytes_atomically(root / PROJECT_FILE_NAME, data, overwrite=True)
+
+
+def _write_bytes_atomically(path: Path, data: bytes, *, overwrite: bool) -> None:
+    """一時ファイルに書いてから置き換えることで、書きかけのファイルを残さずに書き込む。
+
+    Args:
+        path: 書き込み先。親ディレクトリがなければ作る。
+        data: 書き込む内容。
+        overwrite: False なら、既存のファイルがあるときにエラーにする（上書き防止）。
+
+    Raises:
+        FileExistsError: ``overwrite`` が False で、書き込み先が既に存在する場合。
+    """
+    if not overwrite and path.exists():
+        raise FileExistsError(f"既に存在するため書き込みません: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    tmp_path.write_bytes(data)
     tmp_path.replace(path)
 
 

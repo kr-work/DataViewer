@@ -8,27 +8,36 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from experiment_workbench.model import (
+    DATASET_TIME_COLUMN,
     AdaptiveNoiseMethod,
     AdaptiveNoiseParams,
     ButterworthKind,
     ButterworthParams,
+    ChannelData,
+    DataIssue,
+    DataIssueKind,
     DerivativeMethod,
     DerivativeParams,
     Event,
     Experiment,
+    ImportRequest,
     IntegralParams,
+    IssueSeverity,
     KalmanInitialState,
     KalmanResult,
     KinematicSystemParams,
     LinearSystemParams,
     MovingAverageParams,
+    PlotView,
     Project,
+    ReadOptions,
     SavitzkyGolayParams,
     Source,
     SyntheticConfig,
     SyntheticMotion,
     TimeAxisKind,
     TimeBase,
+    TimeUnit,
     Trial,
 )
 from tests.conftest import Hierarchy
@@ -331,3 +340,112 @@ def test_kalman_result_rejects_inconsistent_arrays(
     arrays = _kalman_result_arrays() | {field: value}
     with pytest.raises(ValidationError):
         KalmanResult.model_validate(arrays)
+
+
+# --- 取り込み・表示のモデル ------------------------------------------------------
+
+
+def _import_request(**changes: object) -> dict[str, object]:
+    """正しい取り込み指定の値に、指定した変更を加えた辞書を返す。
+
+    Args:
+        **changes: 上書きする項目。
+
+    Returns:
+        ImportRequest.model_validate に渡す辞書。
+    """
+    base: dict[str, object] = {
+        "file_format": "csv",
+        "time_column": "t",
+        "channels": [{"column": "v"}],
+        "experiment_name": "e",
+        "session_name": "s",
+        "trial_name": "t1",
+        "source_name": "src",
+    }
+    return base | changes
+
+
+def test_import_request_accepts_valid_settings() -> None:
+    """時刻列とチャンネルを正しく指定した取り込みは受け付ける。既定は同期なし・秒。"""
+    request = ImportRequest.model_validate(_import_request())
+    assert request.time_unit is TimeUnit.SECOND
+    assert not request.shares_trial_clock
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"time_column": None},  # 時刻列もサンプル間隔もない
+        {"sample_interval_s": 0.01},  # 時刻列とサンプル間隔の両方
+        {"channels": [{"column": "t"}]},  # 時刻列をチャンネルにも指定
+        {"channels": [{"column": "v"}, {"column": "v"}]},  # チャンネルの重複
+        {"channels": [{"column": DATASET_TIME_COLUMN}]},  # 正規化データの予約名
+        {"channels": []},  # チャンネルがない
+        {"source_name": " "},  # 空白だけの名前
+    ],
+)
+def test_import_request_rejects_ambiguous_settings(changes: dict[str, object]) -> None:
+    """時刻の決め方が定まらない、列が重複・予約名、名前が空などの指定は拒否される。"""
+    with pytest.raises(ValidationError):
+        ImportRequest.model_validate(_import_request(**changes))
+
+
+def test_import_request_without_time_column_needs_interval() -> None:
+    """時刻列がない場合は、サンプル間隔を指定すれば受け付ける。"""
+    request = ImportRequest.model_validate(_import_request(time_column=None, sample_interval_s=0.5))
+    assert request.sample_interval_s == 0.5
+
+
+@pytest.mark.parametrize(
+    "changes", [{"encoding": "no-such-codec"}, {"delimiter": ""}, {"delimiter": ",,"}]
+)
+def test_read_options_reject_invalid_values(changes: dict[str, object]) -> None:
+    """未知の文字コード名や、1 文字でない区切り文字は拒否される。"""
+    with pytest.raises(ValidationError):
+        ReadOptions.model_validate(changes)
+
+
+def test_time_base_defaults_to_independent_clock() -> None:
+    """時間軸は既定で「他と比較しない独立した時計」になる（勝手に揃えない）。"""
+    time_base = TimeBase.model_validate({"kind": "relative_seconds", "original_unit": "ms"})
+    assert time_base.original_unit is TimeUnit.MILLISECOND
+    assert not time_base.shares_trial_clock
+
+
+def test_data_issue_defaults_to_warning() -> None:
+    """異常は既定で警告になり、行番号は省略できる。"""
+    issue = DataIssue(kind=DataIssueKind.NAN_VALUES, description="欠損")
+    assert issue.severity is IssueSeverity.WARNING
+    assert issue.row_index is None
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [{"name": "../main"}, {"name": "表示"}, {"x_range": (0.0, math.nan)}, {"format_version": 0}],
+)
+def test_plot_view_rejects_invalid_values(changes: dict[str, object]) -> None:
+    """表示設定の名前はファイル名に使える文字だけ、範囲は有限値でなければならない。"""
+    with pytest.raises(ValidationError):
+        PlotView.model_validate(changes)
+
+
+@pytest.mark.parametrize(
+    ("time_s", "values"),
+    [
+        (np.zeros(3), np.zeros(2)),  # 長さが違う
+        (np.zeros(3, dtype=np.float32), np.zeros(3, dtype=np.float32)),  # 精度が落ちている
+        (np.zeros((3, 1)), np.zeros((3, 1))),  # 1 次元でない
+    ],
+)
+def test_channel_data_rejects_inconsistent_arrays(
+    hierarchy: Hierarchy,
+    time_s: np.ndarray[tuple[int, ...], np.dtype[np.generic]],
+    values: np.ndarray[tuple[int, ...], np.dtype[np.generic]],
+) -> None:
+    """表示用のチャンネルデータは、同じ長さの float64 の 1 次元配列でなければならない。"""
+    _, _, _, source, channel, _ = hierarchy
+    with pytest.raises(ValidationError):
+        ChannelData.model_validate(
+            {"channel": channel, "source": source, "time_s": time_s, "values": values}
+        )

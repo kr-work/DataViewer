@@ -8,10 +8,13 @@ dependencies = [
     "numpy>=2.5.4",
     "polars>=2.1.0",
     "pydantic>=2.14.1",
+    "pyqtgraph>=0.14.0",
+    "pyside6-essentials>=6.12.0",
     "scipy>=1.18.1",
 ]
 
 [project.scripts]
+ewb = "experiment_workbench.ui.main_window:main"
 ewb-synthetic = "experiment_workbench.synthetic:main"
 
 [build-system]
@@ -23,6 +26,7 @@ dev = [
     "filterpy>=2.0.0",
     "mypy>=2.4.0",
     "pytest>=9.2.0",
+    "pytest-qt>=4.5.0",
     "ruff>=0.17.3",
     "scipy-stubs>=1.18.1.1",
 ]
@@ -70,9 +74,10 @@ strict = true
 files = ["src", "tests"]
 plugins = ["pydantic.mypy"]
 
-# filterpy（テストで線形 KF の答え合わせに使う開発用依存）は型情報を持たないため、import の型検査を省く。
+# filterpy（テストで線形 KF の答え合わせに使う開発用依存）と pyqtgraph は型情報を持たないため、
+# import の型検査を省く（pyqtgraph のクラスは継承せず、合成して使う方針。DECISIONS 参照）。
 [[tool.mypy.overrides]]
-module = ["filterpy.*"]
+module = ["filterpy.*", "pyqtgraph.*"]
 ignore_missing_imports = true
 
 [tool.pydantic-mypy]
@@ -83,3 +88,5 @@ warn_required_dynamic_aliases = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = ["-ra", "--strict-markers", "--strict-config"]
+# GUI のテスト（pytest-qt）で使う Qt バインディング。画面は出さない（tests/conftest.py で offscreen を指定）。
+qt_api = "pyside6"

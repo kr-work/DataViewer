@@ -1,12 +1,23 @@
 """storage/project_store.py（プロジェクトフォルダ）のテスト。"""
 
+import hashlib
 import json
 from pathlib import Path
+from uuid import uuid4
 
+import numpy as np
+import polars as pl
 import pytest
 from pydantic import ValidationError
 
-from experiment_workbench.model import PROJECT_FORMAT_VERSION, Project
+from experiment_workbench.model import (
+    DATASET_TIME_COLUMN,
+    PROJECT_FORMAT_VERSION,
+    VIEW_FORMAT_VERSION,
+    PlotPanelState,
+    PlotView,
+    Project,
+)
 from experiment_workbench.storage import (
     METADATA_DB_NAME,
     PROJECT_FILE_NAME,
@@ -15,6 +26,7 @@ from experiment_workbench.storage import (
     ProjectStoreError,
     SchemaVersionError,
 )
+from tests.conftest import Hierarchy
 
 
 @pytest.fixture
@@ -190,3 +202,86 @@ def test_resolve_rejects_symlink_escaping_project(project_root: Path, tmp_path: 
         pytest.skip("この環境ではシンボリックリンクを作成できない（Windows の権限設定など）")
     with ProjectStore.open(project_root) as store, pytest.raises(ValueError, match="外"):
         store.resolve("originals/link/file.csv")
+
+
+# --- 元データ・正規化データ ------------------------------------------------------
+
+
+def test_write_original_returns_hash_and_refuses_overwrite(project_root: Path) -> None:
+    """元データのコピーは保存した内容の SHA-256 を返し、既存のファイルは上書きしない。"""
+    data = "時刻,値\n0,1\n".encode()
+    with ProjectStore.open(project_root) as store:
+        digest = store.write_original("originals/abc/data.csv", data)
+        assert digest == hashlib.sha256(data).hexdigest()
+        with pytest.raises(FileExistsError):
+            store.write_original("originals/abc/data.csv", b"other")
+        assert store.resolve("originals/abc/data.csv").read_bytes() == data
+
+
+def test_dataset_round_trip_turns_null_into_nan(project_root: Path, hierarchy: Hierarchy) -> None:
+    """正規化データを書いて読み戻すと同じ値になり、欠損（null）は NaN として読める。"""
+    source, channel = hierarchy[3], hierarchy[4]
+    frame = pl.DataFrame(
+        {DATASET_TIME_COLUMN: [0.0, 0.1, 0.2], channel.name: [1.0, None, float("nan")]}
+    )
+    with ProjectStore.open(project_root) as store:
+        store.write_dataset(source.dataset_relpath, frame)
+        data = store.read_channel_data(source, channel)
+    np.testing.assert_array_equal(data.time_s, [0.0, 0.1, 0.2])
+    assert data.values[0] == 1.0
+    assert np.isnan(data.values[1:]).all()
+
+
+def test_read_channel_data_reports_missing_column(project_root: Path, hierarchy: Hierarchy) -> None:
+    """正規化データに列がない場合は、原因が分かるエラーになる。"""
+    source, channel = hierarchy[3], hierarchy[4]
+    with ProjectStore.open(project_root) as store:
+        store.write_dataset(source.dataset_relpath, pl.DataFrame({DATASET_TIME_COLUMN: [0.0]}))
+        with pytest.raises(ProjectStoreError, match=channel.name):
+            store.read_channel_data(source, channel)
+
+
+def test_remove_file_cleans_empty_folder_but_keeps_top_level(project_root: Path) -> None:
+    """書きかけのファイルを消すと空になったフォルダも消えるが、直下のサブディレクトリは残る。"""
+    with ProjectStore.open(project_root) as store:
+        store.write_original("originals/abc/data.csv", b"x")
+        store.remove_file("originals/abc/data.csv")
+        assert not (project_root / "originals" / "abc").exists()
+        assert (project_root / "originals").is_dir()
+        store.remove_file("originals/abc/data.csv")  # 存在しなくてもエラーにしない
+
+
+# --- 表示設定 ------------------------------------------------------------------
+
+
+def test_view_round_trip(project_root: Path) -> None:
+    """表示設定を保存して読み込むと同じ内容になる。"""
+    view = PlotView(
+        panels=[PlotPanelState(channel_ids=[uuid4()], y_range=(-1.0, 1.0)), PlotPanelState()],
+        x_range=(10.0, 20.0),
+        cursor_time_s=12.5,
+    )
+    with ProjectStore.open(project_root) as store:
+        assert store.load_view() is None
+        store.save_view(view)
+        assert store.load_view() == view
+
+
+def test_load_view_rejects_unsafe_name(project_root: Path) -> None:
+    """表示設定の名前にパスの区切りなどは使えない（プロジェクト外のファイルを読ませない）。"""
+    with ProjectStore.open(project_root) as store, pytest.raises(ValueError, match="名前"):
+        store.load_view("../project")
+
+
+def test_load_view_reports_broken_or_newer_file(project_root: Path) -> None:
+    """壊れた表示設定はエラー、新しい形式の表示設定はバージョンのエラーになる。"""
+    views = project_root / ProjectDirectory.VIEWS
+    with ProjectStore.open(project_root) as store:
+        (views / "main.json").write_text("{broken", encoding="utf-8")
+        with pytest.raises(ProjectStoreError, match="JSON"):
+            store.load_view()
+        (views / "main.json").write_text(
+            json.dumps({"format_version": VIEW_FORMAT_VERSION + 1}), encoding="utf-8"
+        )
+        with pytest.raises(SchemaVersionError):
+            store.load_view()

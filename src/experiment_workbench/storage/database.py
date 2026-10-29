@@ -109,8 +109,16 @@ CREATE INDEX idx_events_trial ON events (trial_id);
 CREATE INDEX idx_events_source ON events (source_id, trial_id);
 """
 
+# v2（Phase 2）: 取り込み時の読み込み条件と、検出した異常を Source に記録する。
+# v1 で登録済みの行は、読み込み条件が NULL（記録なし）、異常が空リストになる。
+_SCHEMA_V2 = """
+-- read_options: JSON オブジェクト（ReadOptions）、issues: JSON 配列（DataIssue）
+ALTER TABLE sources ADD COLUMN read_options TEXT;
+ALTER TABLE sources ADD COLUMN issues TEXT NOT NULL DEFAULT '[]';
+"""
+
 # マイグレーション一覧。_MIGRATIONS[i] でバージョン i → i+1 に上げる。追加のみ行うこと。
-_MIGRATIONS: tuple[str, ...] = (_SCHEMA_V1,)
+_MIGRATIONS: tuple[str, ...] = (_SCHEMA_V1, _SCHEMA_V2)
 
 # モデルクラス → テーブル名。ここに登録したモデルだけを保存できる。
 ENTITY_TABLES: Mapping[type[Entity], str] = {
@@ -127,7 +135,7 @@ _JSON_COLUMNS: Mapping[str, frozenset[str]] = {
     "experiments": frozenset(),
     "sessions": frozenset(),
     "trials": frozenset({"tags"}),
-    "sources": frozenset({"time_base"}),
+    "sources": frozenset({"time_base", "read_options", "issues"}),
     "channels": frozenset({"sample_rate"}),
     "events": frozenset({"detection_params"}),
 }
@@ -507,7 +515,9 @@ def _from_row[EntityT: Entity](model: type[EntityT], table: str, row: sqlite3.Ro
     json_columns = _JSON_COLUMNS[table]
     # sqlite3.Row は反復すると「値」を返すため、列名を得るには keys() が必要。
     column_names = row.keys()
+    # NULL の JSON 列（v1 で登録した行の read_options など）は None のままモデルへ渡す。
     data = {
-        name: json.loads(row[name]) if name in json_columns else row[name] for name in column_names
+        name: json.loads(row[name]) if name in json_columns and row[name] is not None else row[name]
+        for name in column_names
     }
     return model.model_validate(data)

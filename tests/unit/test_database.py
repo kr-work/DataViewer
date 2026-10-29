@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from experiment_workbench.model import Entity, Event, Experiment, Project, Session, Trial
+from experiment_workbench.model import Entity, Event, Experiment, Project, Session, Source, Trial
 from experiment_workbench.storage import database
 from experiment_workbench.storage.database import (
     ENTITY_TABLES,
@@ -230,3 +230,52 @@ def test_transaction_rolls_back_on_exception(db_path: Path, hierarchy: Hierarchy
             _insert_then_fail(db, hierarchy)
         assert db.list_entities(Experiment) == []
         assert db.list_entities(Trial) == []
+
+
+def test_v1_database_is_migrated_to_v2(
+    db_path: Path, hierarchy: Hierarchy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """スキーマ v1 の DB を開くと v2 に移行され、既存の Source には新しい列の既定値が入る。
+
+    v2 では Source に読み込み条件（read_options）と取り込み時の異常（issues）を追加した。
+    v1 で登録した行は、読み込み条件が None（記録なし）、異常が空リストになる。
+    """
+    monkeypatch.setattr(database, "_MIGRATIONS", (database._SCHEMA_V1,))
+    MetadataDatabase(db_path).close()
+    experiment, session, trial, source, _, _ = hierarchy
+    conn = sqlite3.connect(db_path)
+    try:
+        for entity, table in (
+            (experiment, "experiments"),
+            (session, "sessions"),
+            (trial, "trials"),
+        ):
+            row = database._to_row(entity)
+            columns = ", ".join(row)
+            conn.execute(
+                f"INSERT INTO {table} ({columns}) VALUES ({', '.join('?' * len(row))})",
+                list(row.values()),
+            )
+        v1_row = {
+            key: value
+            for key, value in database._to_row(source).items()
+            if key not in ("read_options", "issues")
+        }
+        conn.execute(
+            f"INSERT INTO sources ({', '.join(v1_row)}) VALUES ({', '.join('?' * len(v1_row))})",
+            list(v1_row.values()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.undo()
+
+    with MetadataDatabase(db_path) as db:
+        assert db.schema_version == latest_schema_version() >= 2
+        migrated = db.get(Source, source.id)
+    assert migrated.read_options is None
+    assert migrated.issues == []
+    assert migrated.model_dump(exclude={"read_options", "issues"}) == source.model_dump(
+        exclude={"read_options", "issues"}
+    )
+    assert list(db_path.parent.glob(f"{db_path.name}.v1.bak*"))

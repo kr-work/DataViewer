@@ -6,6 +6,7 @@
 ``typing`` モジュールは使わない方針（docs/DECISIONS.md「コーディング規約」）。
 """
 
+import codecs
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import PurePosixPath, PureWindowsPath
@@ -31,6 +32,9 @@ pydantic の pattern は部分一致で判定されるため、空文字・空�
 
 SHA256_PATTERN = r"^[0-9a-f]{64}$"
 """SHA-256 ダイジェストの 16 進小文字表現（64 文字）。"""
+
+VIEW_NAME_PATTERN = r"^[A-Za-z0-9_-]+$"
+"""表示設定の名前（views/<名前>.json のファイル名に使うため、英数字・"_"・"-" に限る）。"""
 
 # 行列の対称性・正定値性の判定に使う許容誤差。保存した JSON の丸め誤差程度は許す。
 _SYMMETRY_RTOL = 1e-9
@@ -143,6 +147,84 @@ def validate_relative_posix_path(value: str) -> str:
     if any(part in ("", ".", "..") for part in value.split("/")):
         raise ValueError(f"空要素・'.'・'..' を含むパスは指定できません: {value!r}")
     return value
+
+
+def check_encoding(value: str) -> str:
+    """文字コード名が Python で使えるコーデック名であることを確認する。
+
+    取り込みの途中ではなく、条件を指定した時点で誤りに気付けるようにするため。
+
+    Args:
+        value: 文字コード名（例: "utf-8"、"cp932"）。
+
+    Returns:
+        入力と同じ文字列。
+
+    Raises:
+        ValueError: 未知の文字コード名の場合。
+    """
+    try:
+        codecs.lookup(value)
+    except LookupError:
+        raise ValueError(f"文字コード {value!r} は使えません（例: utf-8、cp932）") from None
+    return value
+
+
+def check_import_columns(
+    *,
+    time_column: str | None,
+    sample_interval_s: float | None,
+    channel_columns: list[str],
+    reserved_column: str,
+) -> None:
+    """取り込み指定の時刻列・サンプル間隔・チャンネル列の組み合わせを確認する。
+
+    時刻の決め方（時刻列か、サンプル番号 × 間隔か）が必ずどちらか一方に定まるようにする。
+
+    Args:
+        time_column: 時刻列の名前。時刻列がない場合は None。
+        sample_interval_s: 時刻列がない場合のサンプル間隔 [s]。
+        channel_columns: 取り込むチャンネルの列名。
+        reserved_column: 正規化データの時刻列として予約されている名前。
+
+    Raises:
+        ValueError: 時刻の決め方が定まらない、時刻列をチャンネルにも指定した、
+            チャンネル列が重複している、または予約名をチャンネルに指定した場合。
+    """
+    if time_column is None and sample_interval_s is None:
+        raise ValueError("時刻列を選ぶか、時刻列がない場合はサンプル間隔を指定してください")
+    if time_column is not None and sample_interval_s is not None:
+        raise ValueError(
+            "時刻列を使う場合はサンプル間隔を指定しないでください（どちらで時刻を決めたか曖昧になるため）"
+        )
+    if time_column is not None and time_column in channel_columns:
+        raise ValueError(f"時刻列 {time_column!r} はチャンネルとして取り込めません")
+    reject_duplicates(channel_columns)
+    if reserved_column in channel_columns:
+        raise ValueError(
+            f"列名 {reserved_column!r} は正規化データの時刻列として予約されているため、"
+            "チャンネルとして取り込めません"
+        )
+
+
+def check_series_arrays(time_s: FloatArray, values: FloatArray) -> None:
+    """時刻と値の配列が float64 の 1 次元配列で、同じ長さであることを確認する。
+
+    Args:
+        time_s: 時刻 [s] の配列。
+        values: 値の配列。
+
+    Raises:
+        ValueError: dtype・次元・長さが条件を満たさない場合。
+    """
+    for name, array in (("time_s", time_s), ("values", values)):
+        if array.dtype != np.float64 or array.ndim != 1:
+            raise ValueError(
+                f"{name} は float64 の 1 次元配列にしてください"
+                f"（実際: {array.dtype}、{array.ndim} 次元）"
+            )
+    if time_s.shape != values.shape:
+        raise ValueError(f"時刻の長さ {time_s.shape[0]} と値の長さ {values.shape[0]} が違います")
 
 
 def check_time_column_consistency(*, has_time_column: bool, is_sample_index: bool) -> None:

@@ -1,9 +1,13 @@
 # 簡易 CI: Windows と Ubuntu で Lint・フォーマット・型チェック・テストを実行する（SPEC F-09）。
+# GUI のテスト（pytest-qt）は画面を出さない offscreen モードで実行する。
 name: CI
 
 on:
   push:
+    branches: [master]
+    tags: [v*]
   pull_request:
+    branches: [master]
 
 jobs:
   check:
@@ -12,8 +16,15 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      QT_QPA_PLATFORM: offscreen
     steps:
       - uses: actions/checkout@v4
+      - name: Install Qt system libraries (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3 libglib2.0-0
       - uses: astral-sh/setup-uv@v6
       - name: Install dependencies
         run: uv sync --locked

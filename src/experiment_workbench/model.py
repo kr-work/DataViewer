@@ -16,8 +16,8 @@
       サンプリング周波数を勝手に揃えない。揃える場合は将来の「明示的な変換」として記録する。
     - 内部の時刻は秒単位の float64 を基本とし、絶対時刻が必要なら epoch ナノ秒を併用する。
 
-解析コア（SPEC §7 A-01〜A-08）の処理条件と結果のモデルも、このモジュールの末尾に置く。
-Pipeline / View モデルは、それぞれ必要になる Phase（View: Phase 3、Pipeline: v0.2）で追加する。
+解析コア（SPEC §7 A-01〜A-08）の処理条件と結果、データの取り込み、表示状態のモデルも
+このモジュールに置く。Pipeline モデルは v0.2 で追加する。
 """
 
 from datetime import date
@@ -43,15 +43,19 @@ from experiment_workbench import __version__
 from experiment_workbench.validation import (
     NON_BLANK_PATTERN,
     SHA256_PATTERN,
+    VIEW_NAME_PATTERN,
     BoolArray,
     FloatArray,
     check_cutoff_frequencies,
     check_derivative_settings,
+    check_encoding,
+    check_import_columns,
     check_initial_state,
     check_kalman_result_arrays,
     check_linear_system,
     check_odd_window,
     check_polynomial_order,
+    check_series_arrays,
     check_time_column_consistency,
     utc_now,
     validate_relative_posix_path,
@@ -62,6 +66,14 @@ from experiment_workbench.validation import (
 # metadata.sqlite のスキーマバージョン（PRAGMA user_version）とは独立に管理する。
 # 詳細は docs/DECISIONS.md「メタデータの保存先とバージョン管理」を参照。
 PROJECT_FORMAT_VERSION = 1
+
+# 正規化データ（datasets/ の Parquet）で、秒に換算した時刻を入れる列の名前。
+# チャンネル名には使えない（予約名）。"time_s" のような実データでよく使う列名と衝突しないよう、
+# 先頭に "__" を付けている（元ファイルの time_s 列をチャンネルとして取り込めるようにするため）。
+DATASET_TIME_COLUMN = "__time_s"
+
+# 表示設定（views/*.json）の保存形式バージョン。
+VIEW_FORMAT_VERSION = 1
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +189,69 @@ class Trial(Entity):
 
 
 # ---------------------------------------------------------------------------
+# 入力データの異常
+# ---------------------------------------------------------------------------
+
+
+class DataIssueKind(StrEnum):
+    """入力データの異常の種類（SPEC §9「データ整合性」、§10「失敗データ」）。
+
+    合成データに仕込んだ異常の記録と、取り込み時の検証結果の報告に使う。
+    """
+
+    EMPTY_FILE = "empty_file"
+    """ファイルが 0 バイト（またはヘッダー行がない）。"""
+    HEADER_ONLY = "header_only"
+    """ヘッダー行のみでデータ行がない。"""
+    DUPLICATE_COLUMN = "duplicate_column"
+    """同じ列名が複数ある。"""
+    NON_UTF8_ENCODING = "non_utf8_encoding"
+    """指定した文字コードで読めない（Shift_JIS のファイルを UTF-8 として読んだ場合など）。"""
+    NAN_VALUES = "nan_values"
+    """NaN や空欄の値を含む。"""
+    NON_MONOTONIC_TIME = "non_monotonic_time"
+    """時刻が逆行している。"""
+    DUPLICATE_TIMESTAMP = "duplicate_timestamp"
+    """同じ時刻のサンプルが複数ある。"""
+    MISSING_SEGMENT = "missing_segment"
+    """一定区間のサンプルが欠落している（時刻の飛び）。"""
+    NON_NUMERIC_VALUES = "non_numeric_values"
+    """数値として読めない値がある。"""
+    INVALID_COLUMN = "invalid_column"
+    """列名が空、予約名と重なる、または指定した列がない。"""
+    READ_ERROR = "read_error"
+    """ファイルを表として読み込めない（形式や区切り文字の誤りなど）。"""
+
+
+class IssueSeverity(StrEnum):
+    """入力データの異常の重大度。"""
+
+    ERROR = "error"
+    """取り込みを中止する（データとして意味が定まらない）。"""
+    WARNING = "warning"
+    """取り込みは行い、記録と表示で知らせる（データはそのまま保持する）。"""
+
+
+class DataIssue(WorkbenchModel):
+    """入力データの異常 1 件。
+
+    Attributes:
+        kind: 異常の種類。
+        description: 人が読める説明。
+        column: 異常のある列名。ファイル全体に関わる場合は None。
+        severity: 重大度。エラーがあると取り込まない。
+        row_index: 最初に該当したデータ行の番号（0 始まり、ヘッダーを除く）。
+            行に関係しない場合は None。
+    """
+
+    kind: DataIssueKind
+    description: str
+    column: str | None = None
+    severity: IssueSeverity = IssueSeverity.WARNING
+    row_index: NonNegativeInt | None = None
+
+
+# ---------------------------------------------------------------------------
 # 時間軸・Source・Channel
 # ---------------------------------------------------------------------------
 
@@ -193,7 +268,16 @@ class TimeAxisKind(StrEnum):
     RELATIVE_SECONDS = "relative_seconds"
     """装置固有の原点からの相対秒。"""
     ABSOLUTE_EPOCH_NS = "absolute_epoch_ns"
-    """UNIX エポックからのナノ秒（絶対時刻）。"""
+    """UNIX エポックからの時刻（絶対時刻）。単位は ``TimeBase.original_unit`` で表す。"""
+
+
+class TimeUnit(StrEnum):
+    """時刻列の単位。秒への換算係数は timebase.py にある。"""
+
+    SECOND = "s"
+    MILLISECOND = "ms"
+    MICROSECOND = "us"
+    NANOSECOND = "ns"
 
 
 class TimeBase(WorkbenchModel):
@@ -203,20 +287,27 @@ class TimeBase(WorkbenchModel):
 
     Attributes:
         kind: 時刻の種類。
-        original_unit: 元ファイルの時刻列の単位（例: "s"、"ms"、"ns"）。時刻列がない場合は None。
+        original_unit: 元ファイルの時刻列の単位。時刻列がない場合は None。
             正規化時に秒へ換算しても、元の単位をここに残す。
         origin: 時刻原点の説明（例: "装置の電源投入時"、"収録開始"）。不明なら "unknown"。
         clock: 時刻を刻んだ装置クロックの由来（例: "ロガー内部クロック"）。不明なら "unknown"。
         resolution_s: 時刻の分解能 [s]。不明なら None。
         epoch_origin_ns: 相対秒 0 に対応する絶対時刻（エポックナノ秒）。既知の場合のみ。
+        sample_interval_s: 時刻列がない場合に、サンプル番号から時刻 [s] を作るときの間隔。
+            ユーザーが取り込み時に指定する。時刻列がある場合は None。
+        shares_trial_clock: True なら、この Source の時刻（秒に換算後）は、同じ試技で同じく True の
+            Source と同じ時計・同じ原点の値として直接比較できる（ユーザーが取り込み時に明示する）。
+            False なら、他の Source とは時刻を比較できないものとして扱う（勝手に揃えない）。
     """
 
     kind: TimeAxisKind
-    original_unit: str | None = None
+    original_unit: TimeUnit | None = None
     origin: str = "unknown"
     clock: str = "unknown"
     resolution_s: PositiveFloat | None = None
     epoch_origin_ns: int | None = None
+    sample_interval_s: PositiveFloat | None = None
+    shares_trial_clock: bool = False
 
 
 class SampleRate(WorkbenchModel):
@@ -242,6 +333,34 @@ class SourceFormat(StrEnum):
     PARQUET = "parquet"
 
 
+class ReadOptions(WorkbenchModel):
+    """元ファイルを表として読み込むときの条件（同じ条件で読み直せるよう記録する）。
+
+    Attributes:
+        delimiter: 区切り文字（1 文字）。CSV はカンマ、TSV はタブなど。Parquet では使わない。
+        encoding: 文字コード（Python のコーデック名。例: "utf-8"、"cp932"）。Parquet では使わない。
+            UTF-8 の BOM は "utf-8" のままで読める（BOM はデータではないため取り除いて読む）。
+        skip_rows: ヘッダー行の前に読み飛ばす行数（装置が書き出す前置きの行など）。
+    """
+
+    delimiter: str = Field(default=",", min_length=1, max_length=1)
+    encoding: str = "utf-8"
+    skip_rows: NonNegativeInt = 0
+
+    @field_validator("encoding")
+    @classmethod
+    def _check_encoding(cls, value: str) -> str:
+        """文字コード名を検証する（validation.check_encoding に委ねる）。
+
+        Args:
+            value: 文字コード名。
+
+        Returns:
+            入力と同じ文字列。
+        """
+        return check_encoding(value)
+
+
 class Source(Entity):
     """1 つの入力ファイル由来のデータ群。
 
@@ -259,6 +378,9 @@ class Source(Entity):
         dataset_relpath: 正規化データ（Parquet）の相対パス。
         time_column: 元ファイルで時刻として使った列名。時刻列がない場合は None。
         time_base: この Source の時間軸の定義。
+        read_options: CSV / TSV の読み込み条件。Parquet と、スキーマ v1 で登録した Source は None。
+        issues: 取り込み時に検出した異常（警告）。
+            エラーがあるファイルは取り込まないため、警告のみが入る。
     """
 
     trial_id: UUID
@@ -271,6 +393,8 @@ class Source(Entity):
     dataset_relpath: str
     time_column: str | None
     time_base: TimeBase
+    read_options: ReadOptions | None = None
+    issues: list[DataIssue] = Field(default_factory=list)
 
     @field_validator("original_relpath", "dataset_relpath")
     @classmethod
@@ -366,49 +490,6 @@ class Event(Entity):
 
 
 # ---------------------------------------------------------------------------
-# 入力データの異常
-# ---------------------------------------------------------------------------
-
-
-class DataIssueKind(StrEnum):
-    """入力データの異常の種類（SPEC §9「データ整合性」、§10「失敗データ」）。
-
-    合成データに仕込んだ異常の記録と、取り込み時の検証結果の報告に使う。
-    """
-
-    EMPTY_FILE = "empty_file"
-    """ファイルが 0 バイト。"""
-    HEADER_ONLY = "header_only"
-    """ヘッダー行のみでデータ行がない。"""
-    DUPLICATE_COLUMN = "duplicate_column"
-    """同じ列名が複数ある。"""
-    NON_UTF8_ENCODING = "non_utf8_encoding"
-    """UTF-8 以外の文字コード（Shift_JIS など）。"""
-    NAN_VALUES = "nan_values"
-    """NaN や空欄の値を含む。"""
-    NON_MONOTONIC_TIME = "non_monotonic_time"
-    """時刻が逆行している。"""
-    DUPLICATE_TIMESTAMP = "duplicate_timestamp"
-    """同じ時刻のサンプルが複数ある。"""
-    MISSING_SEGMENT = "missing_segment"
-    """一定区間のサンプルが欠落している（時刻の飛び）。"""
-
-
-class DataIssue(WorkbenchModel):
-    """入力データの異常 1 件。
-
-    Attributes:
-        kind: 異常の種類。
-        description: 人が読める説明。
-        column: 異常のある列名。ファイル全体に関わる場合は None。
-    """
-
-    kind: DataIssueKind
-    description: str
-    column: str | None = None
-
-
-# ---------------------------------------------------------------------------
 # 合成データ（SPEC §10）
 # ---------------------------------------------------------------------------
 
@@ -499,7 +580,7 @@ class SyntheticSourceRecord(WorkbenchModel):
 
     relpath: str
     time_column: str
-    time_unit: str
+    time_unit: TimeUnit
     nominal_rate_hz: PositiveFloat
     n_rows: NonNegativeInt
     column_units: dict[str, str]
@@ -940,3 +1021,190 @@ class KalmanResult(WorkbenchModel):
             self.noise_floor_applied,
         )
         return self
+
+
+# ---------------------------------------------------------------------------
+# データの取り込み（SPEC F-02・F-03）
+# ---------------------------------------------------------------------------
+
+
+class ChannelImportSpec(WorkbenchModel):
+    """取り込むチャンネル（列）1 つの指定。
+
+    Attributes:
+        column: 元ファイルの列名（空白のみは不可）。正規化データでも同じ名前の列になる。
+        unit: 単位（任意。例: "V"、"N"）。単位の換算はしない（換算は v0.2 の単位変換で扱う）。
+    """
+
+    column: str = Field(pattern=NON_BLANK_PATTERN)
+    unit: str | None = None
+
+
+class ImportRequest(WorkbenchModel):
+    """1 つのファイルを取り込むときの指定（取り込みダイアログでユーザーが選ぶ内容）。
+
+    Attributes:
+        file_format: ファイル形式。
+        read_options: 読み込み条件（CSV / TSV で使う）。
+        time_column: 時刻として使う列。
+            時刻列がない場合は None とし、``sample_interval_s`` を指定する。
+        time_unit: 時刻列の単位。秒に換算して正規化データに保存し、元の単位は TimeBase に残す。
+        time_is_absolute: 時刻列が UNIX エポックからの値（絶対時刻）なら True。
+        sample_interval_s: 時刻列がない場合のサンプル間隔 [s]。時刻列がある場合は指定しない。
+        channels: 取り込むチャンネル（1 つ以上。列名の重複は不可）。
+        experiment_name: 登録先の実験名。同じ名前があればそれを使い、なければ作る。
+        session_name: 登録先のセッション名（実験の中で同じ扱い）。
+        trial_name: 登録先の試技名（セッションの中で同じ扱い）。
+        source_name: Source 名。同じ試技の中で一意でなければならない。
+        shares_trial_clock: この試技の他の同期済み Source と同じ時計・同じ原点で記録した
+            （時刻を直接比較できる）なら True。TimeBase.shares_trial_clock として記録する。
+    """
+
+    file_format: SourceFormat
+    read_options: ReadOptions = Field(default_factory=ReadOptions)
+    time_column: str | None
+    time_unit: TimeUnit = TimeUnit.SECOND
+    time_is_absolute: bool = False
+    sample_interval_s: PositiveFloat | None = None
+    channels: list[ChannelImportSpec] = Field(min_length=1)
+    experiment_name: str = Field(pattern=NON_BLANK_PATTERN)
+    session_name: str = Field(pattern=NON_BLANK_PATTERN)
+    trial_name: str = Field(pattern=NON_BLANK_PATTERN)
+    source_name: str = Field(pattern=NON_BLANK_PATTERN)
+    shares_trial_clock: bool = False
+
+    @model_validator(mode="after")
+    def _check_columns(self) -> "ImportRequest":
+        """時刻列・サンプル間隔・チャンネル列の組み合わせを確認する（validation に委ねる）。
+
+        Returns:
+            検証済みの自身。
+        """
+        check_import_columns(
+            time_column=self.time_column,
+            sample_interval_s=self.sample_interval_s,
+            channel_columns=[channel.column for channel in self.channels],
+            reserved_column=DATASET_TIME_COLUMN,
+        )
+        return self
+
+
+class ColumnPreview(WorkbenchModel):
+    """プレビューで分かった列の情報。
+
+    Attributes:
+        name: 列名。
+        dtype: 先頭行から推定した型（表示用。Polars の型名）。
+        is_numeric: 数値の列なら True。数値でない列はチャンネルとして取り込めない。
+    """
+
+    name: str
+    dtype: str
+    is_numeric: bool
+
+
+class FilePreview(WorkbenchModel):
+    """取り込み前のプレビュー（ファイルの先頭部分と、読み込み前に分かる異常）。
+
+    Attributes:
+        columns: 列の情報（ファイル内の順）。
+        rows: 先頭数行の値（表示用の文字列。欠損は空文字）。
+        issues: ヘッダー・文字コード・データ行の有無など、ファイル全体を読む前に分かる異常。
+    """
+
+    columns: list[ColumnPreview]
+    rows: list[list[str]]
+    issues: list[DataIssue]
+
+
+class ImportTargets(WorkbenchModel):
+    """取り込み先の実験・セッション・試技（名前から解決した結果）。
+
+    Attributes:
+        experiment: 登録先の実験。
+        session: 登録先のセッション。
+        trial: 登録先の試技。
+        new_entities: まだ DB にない（取り込みの確定時に登録する）エンティティ。親から子の順。
+    """
+
+    experiment: Experiment
+    session: Session
+    trial: Trial
+    new_entities: list[Experiment | Session | Trial] = Field(default_factory=list)
+
+
+class PreparedImport(WorkbenchModel):
+    """ファイルの検証・コピー・正規化が終わり、DB への登録を待っている取り込み結果。
+
+    Attributes:
+        source: 登録する Source（警告は ``source.issues`` に入っている）。
+        channels: 登録するチャンネル。
+        written_relpaths: 書き込んだファイルの相対パス（登録に失敗したら削除する）。
+    """
+
+    source: Source
+    channels: list[Channel]
+    written_relpaths: list[str]
+
+
+# ---------------------------------------------------------------------------
+# 表示（SPEC F-07・F-10）
+# ---------------------------------------------------------------------------
+
+
+class ChannelData(WorkbenchModel):
+    """表示や解析に渡す 1 チャンネル分のデータ（正規化データから読み込んだもの）。
+
+    Attributes:
+        channel: チャンネルのメタデータ。
+        source: チャンネルが属する Source（時間軸の判定に使う）。
+        time_s: 時刻 [s]（Source の時間軸のまま。他の Source と勝手に揃えない）。
+        values: 値。欠損（空欄・NaN）は NaN。
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    channel: Channel
+    source: Source
+    time_s: FloatArray
+    values: FloatArray
+
+    @model_validator(mode="after")
+    def _check_arrays(self) -> "ChannelData":
+        """時刻と値の配列の dtype と形を確認する（validation に委ねる）。
+
+        Returns:
+            検証済みの自身。
+        """
+        check_series_arrays(self.time_s, self.values)
+        return self
+
+
+class PlotPanelState(WorkbenchModel):
+    """縦並べ表示の 1 パネルの状態。
+
+    Attributes:
+        channel_ids: パネルに表示するチャンネル（表示順）。
+        y_range: 縦軸の範囲 (最小, 最大)。None なら自動調整。
+    """
+
+    channel_ids: list[UUID] = Field(default_factory=list)
+    y_range: tuple[FiniteFloat, FiniteFloat] | None = None
+
+
+class PlotView(WorkbenchModel):
+    """縦並べ表示の状態（views/<name>.json に保存する）。
+
+    Attributes:
+        format_version: 保存形式のバージョン。
+        name: 表示設定の名前（ファイル名に使うため英数字・"_"・"-" のみ）。
+        panels: 上から順のパネル。
+        x_range: 基準パネル（最初にデータを置いたパネル）の時間軸の範囲 [s]。None なら自動調整。
+        cursor_time_s: 基準パネルのカーソル位置 [s]。None なら未設定。
+    """
+
+    format_version: PositiveInt = VIEW_FORMAT_VERSION
+    name: str = Field(default="main", pattern=VIEW_NAME_PATTERN)
+    panels: list[PlotPanelState] = Field(default_factory=list)
+    x_range: tuple[FiniteFloat, FiniteFloat] | None = None
+    cursor_time_s: FiniteFloat | None = None
