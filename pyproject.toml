@@ -1,0 +1,85 @@
+[project]
+name = "experiment-workbench"
+version = "0.1.0"
+description = "研究実験の時系列データを読み込み・同期・比較・再現するための汎用ワークベンチ"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.5.4",
+    "polars>=2.1.0",
+    "pydantic>=2.14.1",
+    "scipy>=1.18.1",
+]
+
+[project.scripts]
+ewb-synthetic = "experiment_workbench.synthetic:main"
+
+[build-system]
+requires = ["uv_build>=0.11.14,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "filterpy>=2.0.0",
+    "mypy>=2.4.0",
+    "pytest>=9.2.0",
+    "ruff>=0.17.3",
+    "scipy-stubs>=1.18.1.1",
+]
+
+# ---------------------------------------------------------------------------
+# 品質ツール設定
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+    "N",    # pep8-naming
+    "SIM",  # flake8-simplify
+    "C4",   # flake8-comprehensions
+    "PTH",  # pathlib の使用を促す
+    "PT",   # pytest のスタイル
+    "D",    # docstring（CLAUDE.md の「docstring を必ず書く」方針を機械的に担保する）
+    "RUF",
+]
+ignore = [
+    # 日本語の docstring・コメントで全角記号（（）、：など）を使うため無効化する。
+    "RUF001",
+    "RUF002",
+    "RUF003",
+    # 日本語の文末「。」は英語の句読点チェックと相性が悪いため無効化する。
+    "D415",
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src", "tests"]
+plugins = ["pydantic.mypy"]
+
+# filterpy（テストで線形 KF の答え合わせに使う開発用依存）は型情報を持たないため、import の型検査を省く。
+[[tool.mypy.overrides]]
+module = ["filterpy.*"]
+ignore_missing_imports = true
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
