@@ -10,26 +10,33 @@ import pytest
 from filterpy.kalman import KalmanFilter as FilterpyKalmanFilter
 
 from experiment_workbench.analysis import (
+    AnalysisCancelledError,
     AnalysisInputError,
     KalmanFilter,
     KinematicSystem,
     LinearSystem,
     NonlinearSystem,
+    PolynomialObservationSystem,
     kinematic_process_noise,
     kinematic_transition_matrix,
+    system_from_settings,
 )
 from experiment_workbench.model import (
     AdaptiveNoiseMethod,
     AdaptiveNoiseParams,
     KalmanInitialState,
+    KalmanModelKind,
     KalmanResult,
+    KalmanSettings,
     KinematicSystemParams,
     LinearSystemParams,
+    PolynomialObservationParams,
 )
 from experiment_workbench.validation import FloatArray
 
 DT = 0.01  # 等間隔テストの時間間隔 [s]
 BEACON_HEIGHT = 1.0  # EKF テストで距離を測る基準点の高さ [m]
+POLYNOMIAL = (0.5, 2.0, 0.3)  # 多項式の観測モデルのテストで使う係数 z = c0 + c1 x + c2 x²
 
 INITIAL_CV = KalmanInitialState(state=[0.0, 0.0], covariance=[[1.0, 0.0], [0.0, 10.0]])
 """等速度モデル用の初期状態（位置 0・速度 0、不確かさは大きめ）。"""
@@ -174,6 +181,64 @@ def _wrong_size_observation(state: FloatArray) -> FloatArray:
     return state.copy()
 
 
+def _polynomial_observation(state: FloatArray) -> FloatArray:
+    """係数 POLYNOMIAL の 2 次式による観測 h(x) = c0 + c1 x + c2 x²。
+
+    Args:
+        state: 状態 [x, x の微分]。
+
+    Returns:
+        予測観測（長さ 1）。
+    """
+    c0, c1, c2 = POLYNOMIAL
+    x = state[0]
+    return np.array([c0 + c1 * x + c2 * x**2])
+
+
+def _polynomial_observation_jacobian(state: FloatArray) -> FloatArray:
+    """2 次式の観測のヤコビアン [[c1 + 2 c2 x, 0]]。
+
+    Args:
+        state: 状態 [x, x の微分]。
+
+    Returns:
+        1×2 行列。
+    """
+    _, c1, c2 = POLYNOMIAL
+    return np.array([[c1 + 2.0 * c2 * state[0], 0.0]])
+
+
+class _ProgressRecorder:
+    """KalmanFilter.run に渡す進捗の関数。受け取った進捗を記録し、指定回数で中止を指示する。
+
+    関数内関数を使わずに状態を持たせるため、呼び出し可能なクラスにしている。
+
+    Attributes:
+        fractions: 受け取った進捗（0〜1）。
+    """
+
+    def __init__(self, stop_at_call: int | None = None) -> None:
+        """中止を指示する呼び出し回数を受け取る。
+
+        Args:
+            stop_at_call: この回数目の呼び出しで False（中止）を返す。None なら中止しない。
+        """
+        self._stop_at_call = stop_at_call
+        self.fractions: list[float] = []
+
+    def __call__(self, fraction: float) -> bool:
+        """進捗を記録し、続けるかどうかを返す。
+
+        Args:
+            fraction: 進捗（0〜1）。
+
+        Returns:
+            続けるなら True。
+        """
+        self.fractions.append(fraction)
+        return self._stop_at_call is None or len(self.fractions) < self._stop_at_call
+
+
 # --- 運動学モデルの行列 -------------------------------------------------------
 
 
@@ -258,6 +323,91 @@ def test_linear_kf_matches_filterpy() -> None:
 
     np.testing.assert_allclose(result.states, np.array(states), rtol=1e-9, atol=1e-12)
     np.testing.assert_allclose(result.covariances, np.array(covariances), rtol=1e-9, atol=1e-12)
+
+
+def test_two_dimensional_observation_matches_filterpy() -> None:
+    """位置と速度を同時に観測する（観測が 2 次元の）場合も、filterpy の結果と一致する。
+
+    観測が 1 次元のときはゲインを割り算で、多次元のときは連立方程式で求めるため、
+    多次元の計算経路も確認する。
+    """
+    rng = np.random.default_rng(4)
+    t = np.arange(300, dtype=np.float64) * DT
+    z = np.column_stack(
+        [np.sin(t) + rng.normal(0.0, 0.05, t.size), np.cos(t) + rng.normal(0.0, 0.2, t.size)]
+    )
+    params = LinearSystemParams(
+        transition=kinematic_transition_matrix(2, DT).tolist(),
+        observation=[[1.0, 0.0], [0.0, 1.0]],
+        process_noise=kinematic_process_noise(2, 5.0, DT).tolist(),
+        measurement_noise=[[0.05**2, 0.0], [0.0, 0.2**2]],
+    )
+    result = KalmanFilter(LinearSystem(params), INITIAL_CV).run(t, z)
+
+    reference = FilterpyKalmanFilter(dim_x=2, dim_z=2)
+    reference.x = np.array([[0.0], [0.0]])
+    reference.P = np.array(INITIAL_CV.covariance)
+    reference.F = np.array(params.transition)
+    reference.H = np.array(params.observation)
+    reference.Q = np.array(params.process_noise)
+    reference.R = np.array(params.measurement_noise)
+    states: list[FloatArray] = []
+    for k, measurement in enumerate(z):
+        if k > 0:
+            reference.predict()
+        reference.update(measurement.reshape(2, 1))
+        states.append(reference.x.ravel().copy())
+    np.testing.assert_allclose(result.states, np.array(states), rtol=1e-9, atol=1e-12)
+
+
+def test_progress_is_reported_until_the_end() -> None:
+    """進捗の関数は一定のステップごとに 0〜1 の増える値で呼ばれ、結果は渡さない場合と同じ。"""
+    t = np.arange(5000, dtype=np.float64) * DT
+    z = np.sin(t)
+    system = KinematicSystem(
+        KinematicSystemParams(process_noise_density=1.0, measurement_noise_std=0.1)
+    )
+    recorder = _ProgressRecorder()
+    with_progress = KalmanFilter(system, INITIAL_CV).run(t, z, recorder)
+    without_progress = KalmanFilter(system, INITIAL_CV).run(t, z)
+    assert recorder.fractions[0] == 0.0
+    assert len(recorder.fractions) >= 2
+    assert all(0.0 <= value < 1.0 for value in recorder.fractions)
+    assert recorder.fractions == sorted(recorder.fractions)
+    np.testing.assert_array_equal(with_progress.states, without_progress.states)
+
+
+def test_progress_returning_false_cancels_filter() -> None:
+    """進捗の関数が False を返すと、計算を途中でやめて AnalysisCancelledError を送出する。"""
+    t = np.arange(5000, dtype=np.float64) * DT
+    system = KinematicSystem(
+        KinematicSystemParams(process_noise_density=1.0, measurement_noise_std=0.1)
+    )
+    recorder = _ProgressRecorder(stop_at_call=2)
+    with pytest.raises(AnalysisCancelledError):
+        KalmanFilter(system, INITIAL_CV).run(t, np.sin(t), recorder)
+    assert len(recorder.fractions) == 2  # 中止を指示した後は計算を続けない
+
+
+def test_kinematic_matrices_are_cached_read_only_and_stay_correct() -> None:
+    """運動学モデルの F・Q は時間幅ごとに覚えて使い回し、書き換えられないようにする。
+
+    覚えておく数の上限を超えるほど多くの時間幅を使っても、正しい行列を返す。
+    """
+    system = KinematicSystem(
+        KinematicSystemParams(process_noise_density=2.0, measurement_noise_std=0.1)
+    )
+    _, first = system.predict(np.zeros(2), DT)
+    _, again = system.predict(np.zeros(2), DT)
+    assert again is first  # 同じ時間幅では計算し直さない
+    assert not first.flags.writeable
+    with pytest.raises(ValueError, match="read-only"):
+        first[0, 1] = 0.0
+    for step in range(1, 301):
+        dt = 0.001 * step
+        _, transition = system.predict(np.zeros(2), dt)
+        np.testing.assert_array_equal(transition, kinematic_transition_matrix(2, dt))
+        np.testing.assert_array_equal(system.process_noise(dt), kinematic_process_noise(2, 2.0, dt))
 
 
 def test_kinematic_filter_on_non_uniform_time_beats_raw_measurement() -> None:
@@ -404,6 +554,118 @@ def test_nonlinear_system_rejects_invalid_noise_covariance() -> None:
             process_noise=np.zeros((2, 2)),
             measurement_noise=np.array([[0.0]]),
         )
+
+
+def _polynomial_params(noise_std: float) -> PolynomialObservationParams:
+    """係数 POLYNOMIAL の多項式の観測モデルの条件を作る。
+
+    Args:
+        noise_std: 観測雑音の標準偏差。
+
+    Returns:
+        多項式の観測モデルの条件。
+    """
+    return PolynomialObservationParams(
+        process_noise_density=10.0, measurement_noise_std=noise_std, coefficients=list(POLYNOMIAL)
+    )
+
+
+def test_polynomial_observation_system_equals_generic_ekf() -> None:
+    """多項式の観測モデルは、同じ関数を Python で与えた汎用の EKF と同じ結果になる。"""
+    rng = np.random.default_rng(5)
+    t = np.arange(400, dtype=np.float64) * DT
+    x = 2.0 + np.sin(np.pi * t)
+    z = POLYNOMIAL[0] + POLYNOMIAL[1] * x + POLYNOMIAL[2] * x**2 + rng.normal(0.0, 0.05, t.size)
+    initial = KalmanInitialState(state=[2.0, 0.0], covariance=[[1.0, 0.0], [0.0, 10.0]])
+    builtin = KalmanFilter(PolynomialObservationSystem(_polynomial_params(0.05)), initial).run(t, z)
+    generic_system = NonlinearSystem(
+        _cv_transition,
+        _cv_transition_jacobian,
+        _polynomial_observation,
+        _polynomial_observation_jacobian,
+        process_noise=kinematic_process_noise(2, 10.0, DT),
+        measurement_noise=np.array([[0.05**2]]),
+    )
+    generic = KalmanFilter(generic_system, initial).run(t, z)
+    np.testing.assert_allclose(builtin.states, generic.states, rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(builtin.covariances, generic.covariances, rtol=1e-10, atol=1e-12)
+
+
+def test_polynomial_observation_ekf_recovers_hidden_quantity() -> None:
+    """センサの出力 z が物理量 x の 2 次式のとき、EKF で x とその変化率を推定できる。
+
+    比較対象は、各時刻の z から 2 次方程式を解いて逆算しただけの x。EKF はこれより誤差が
+    小さく、変化率も逆算値の差分より正確になる（電圧から張力を推定する場面を想定）。
+    """
+    rng = np.random.default_rng(6)
+    t = np.arange(1000, dtype=np.float64) * DT
+    x = 2.0 + np.sin(np.pi * t)
+    rate = np.pi * np.cos(np.pi * t)
+    c0, c1, c2 = POLYNOMIAL
+    z = c0 + c1 * x + c2 * x**2 + rng.normal(0.0, 0.1, t.size)
+    initial = KalmanInitialState(state=[2.0, 0.0], covariance=[[1.0, 0.0], [0.0, 10.0]])
+    result = KalmanFilter(PolynomialObservationSystem(_polynomial_params(0.1)), initial).run(t, z)
+    inverted = (-c1 + np.sqrt(c1**2 - 4.0 * c2 * (c0 - z))) / (2.0 * c2)
+    burn_in = 100
+    assert _rmse(result.states[burn_in:, 0], x[burn_in:]) < 0.7 * _rmse(
+        inverted[burn_in:], x[burn_in:]
+    )
+    naive_rate = np.gradient(inverted, t)
+    assert _rmse(result.states[burn_in:, 1], rate[burn_in:]) < 0.25 * _rmse(
+        naive_rate[burn_in:], rate[burn_in:]
+    )
+
+
+_INITIAL_2D = {"state": [0.0, 0.0], "covariance": [[1.0, 0.0], [0.0, 1.0]]}
+"""system_from_settings のテストで使う 2 次元の初期状態。"""
+
+
+@pytest.mark.parametrize(
+    ("settings", "expected_type"),
+    [
+        (
+            {
+                "model_kind": KalmanModelKind.KINEMATIC,
+                "kinematic": {"process_noise_density": 1.0, "measurement_noise_std": 0.1},
+            },
+            KinematicSystem,
+        ),
+        (
+            {
+                "model_kind": KalmanModelKind.LINEAR,
+                "linear": {
+                    "transition": [[1.0, DT], [0.0, 1.0]],
+                    "observation": [[1.0, 0.0]],
+                    "process_noise": [[1e-6, 0.0], [0.0, 1e-4]],
+                    "measurement_noise": [[0.01]],
+                },
+            },
+            LinearSystem,
+        ),
+        (
+            {
+                "model_kind": KalmanModelKind.POLYNOMIAL_OBSERVATION,
+                "polynomial_observation": {
+                    "process_noise_density": 1.0,
+                    "measurement_noise_std": 0.1,
+                    "coefficients": [0.0, 1.0],
+                },
+            },
+            PolynomialObservationSystem,
+        ),
+    ],
+    ids=["kinematic", "linear", "polynomial_observation"],
+)
+def test_system_from_settings_builds_selected_model(
+    settings: dict[str, object], expected_type: type
+) -> None:
+    """保存できる条件から、選んだ種類の状態空間モデルを作る。"""
+    system = system_from_settings(
+        KalmanSettings.model_validate(settings | {"initial": _INITIAL_2D})
+    )
+    assert isinstance(system, expected_type)
+    assert system.state_dim == 2
+    assert system.measurement_dim == 1
 
 
 # --- 適応 KF ------------------------------------------------------------------

@@ -10,19 +10,22 @@
     ├── manifest.json        # 生成条件と真値（SyntheticManifest）
     ├── trial_001/
     │   ├── high_rate.csv    # 高レート（既定 1000 Hz）: 加速度の観測値 + 真値列
-    │   └── low_rate.csv     # 低レート（既定 100 Hz）: 位置の観測値 + 真値列
+    │   ├── low_rate.csv     # 低レート（既定 100 Hz）: 位置の観測値 + 真値列
+    │   └── io_pair.csv      # 入出力: むだ時間・一次遅れ・遊びが既知の系の入力と出力
     ├── trial_002/ ...
     └── broken/              # 取り込みエラー検証用の失敗データ
 
 各ファイルの列:
     - high_rate.csv: ``time_s, accel, true_accel, true_velocity, true_position``
     - low_rate.csv: ``time_ms, position, true_position, true_velocity``
+    - io_pair.csv: ``time_s, input, output, true_input, true_output``
 
 使い方の例:
     - ``accel`` にはバイアス・白色ノイズ・高周波の振動が乗っている。
       ローパスフィルタや、積分によるドリフトの確認に使う。
     - ``position`` には白色ノイズが乗っている。カルマンフィルタで位置・速度を推定する確認に使う。
-    - 2 つのファイルは周波数・時刻原点・時刻の単位が異なる。明示的な時刻同期の確認に使う。
+    - high_rate と low_rate は周波数・時刻原点・時刻の単位が異なる。明示的な時刻同期の確認に使う。
+    - io_pair の前半はステップ入力（遅れ・時定数の確認）、後半は三角波の入力（ヒステリシスの確認）。
 
 意図的に仕込む異常（試技 index は 0 始まり）:
     - index % 3 == 1: high_rate.csv の一部区間の行を削除する（時刻の飛び）。
@@ -44,6 +47,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 from pydantic import ValidationError
+from scipy import signal
 
 from experiment_workbench import __version__
 from experiment_workbench.model import (
@@ -52,6 +56,7 @@ from experiment_workbench.model import (
     SineComponent,
     SyntheticBrokenFileRecord,
     SyntheticConfig,
+    SyntheticIoSystem,
     SyntheticManifest,
     SyntheticMotion,
     SyntheticSourceRecord,
@@ -63,6 +68,7 @@ from experiment_workbench.validation import FloatArray
 MANIFEST_FILE_NAME = "manifest.json"
 HIGH_RATE_FILE_NAME = "high_rate.csv"
 LOW_RATE_FILE_NAME = "low_rate.csv"
+IO_PAIR_FILE_NAME = "io_pair.csv"
 
 # CSV に書き出す浮動小数点の小数桁数。1 kHz の時刻（1 ms）を µs の分解能で表せ、
 # ファイルサイズが大きくなりすぎない桁数にしている。
@@ -140,15 +146,17 @@ class SyntheticDataGenerator:
         motion = _random_motion(rng)
         # 試技ごとの個体差として、ノイズの大きさを 0.8〜1.5 倍の範囲で変える。
         noise_gain = float(rng.uniform(0.8, 1.5))
-        sources = [
-            self._write_high_rate(
-                trial_dir, rng, motion, noise_gain, drop_segment=trial_index % 3 == 1
-            ),
-            self._write_low_rate(
-                trial_dir, rng, motion, noise_gain, inject_nan=trial_index % 3 == 2
-            ),
-        ]
-        return SyntheticTrialRecord(name=name, motion=motion, sources=sources)
+        high = self._write_high_rate(
+            trial_dir, rng, motion, noise_gain, drop_segment=trial_index % 3 == 1
+        )
+        low = self._write_low_rate(
+            trial_dir, rng, motion, noise_gain, inject_nan=trial_index % 3 == 2
+        )
+        # 入出力のデータは、既存のファイルの乱数を変えないよう、最後に乱数を使って作る。
+        io_pair, io_system = self._write_io_pair(trial_dir, rng, high)
+        return SyntheticTrialRecord(
+            name=name, motion=motion, sources=[high, low], io_pair=io_pair, io_system=io_system
+        )
 
     def _max_start_delay_s(self) -> float:
         """収録開始の遅れ（真の時刻）の上限を返す。
@@ -344,6 +352,70 @@ class SyntheticDataGenerator:
             injected_issues=issues,
         )
 
+    def _write_io_pair(
+        self, trial_dir: Path, rng: np.random.Generator, high: SyntheticSourceRecord
+    ) -> tuple[SyntheticSourceRecord, SyntheticIoSystem]:
+        """入出力の合成データ（io_pair.csv）を書き出す。
+
+        入力に対する応答（むだ時間・一次遅れ）と遊び（ヒステリシス）が既知の系の、入力と出力を
+        同じファイルに記録したデータ。モデルは SyntheticIoSystem を参照。前半はステップ応答、
+        後半はヒステリシスの解析の確認に使う。高レートファイルと同じ装置で記録した想定で、
+        時刻の原点・周波数・収録開始は高レートファイルと同じにする。
+
+        Args:
+            trial_dir: 試技のディレクトリ。
+            rng: 乱数生成器。
+            high: 高レートファイルの記録（時刻の原点と収録開始に使う）。
+
+        Returns:
+            (書き出したファイルの記録, 系の真値)。
+        """
+        rate = high.nominal_rate_hz
+        t = _true_sample_times(high.recording_start_true_s, self.config.duration_s, rate)
+        span = float(t[-1] - t[0])
+        system = _random_io_system(rng, t, rate)
+        true_input = _io_input(system, t)
+        true_output = evaluate_io_output(system, true_input, rate)
+        measured_input = true_input + rng.normal(0.0, system.input_noise_std, t.size)
+        measured_output = true_output + rng.normal(0.0, system.output_noise_std, t.size)
+        frame = pl.DataFrame(
+            {
+                "time_s": high.clock_offset_s + t,
+                "input": measured_input,
+                "output": measured_output,
+                "true_input": true_input,
+                "true_output": true_output,
+            }
+        )
+        frame.write_csv(trial_dir / IO_PAIR_FILE_NAME, float_precision=CSV_FLOAT_PRECISION)
+        record = SyntheticSourceRecord(
+            relpath=f"{trial_dir.name}/{IO_PAIR_FILE_NAME}",
+            time_column="time_s",
+            time_unit=TimeUnit.SECOND,
+            nominal_rate_hz=rate,
+            n_rows=frame.height,
+            column_units={
+                "time_s": "s",
+                "input": "a.u.",
+                "output": "a.u.",
+                "true_input": "a.u.",
+                "true_output": "a.u.",
+            },
+            measured_columns=["input", "output"],
+            truth_columns=["true_input", "true_output"],
+            clock_offset_s=high.clock_offset_s,
+            recording_start_true_s=high.recording_start_true_s,
+            measurement_model=(
+                "output = offset + gain * LAG[play(true_input)](t - delay) + N(0, sigma_y^2), "
+                f"input = true_input + N(0, sigma_u^2); span {span:.3f} s"
+            ),
+            noise_parameters={
+                "input_noise_std": system.input_noise_std,
+                "output_noise_std": system.output_noise_std,
+            },
+        )
+        return record, system
+
     # --- 失敗データ ----------------------------------------------------------
 
     def _write_broken_files(self, output_dir: Path) -> list[SyntheticBrokenFileRecord]:
@@ -526,6 +598,94 @@ def _random_motion(rng: np.random.Generator) -> SyntheticMotion:
     )
 
 
+def _random_io_system(rng: np.random.Generator, t: FloatArray, rate_hz: float) -> SyntheticIoSystem:
+    """入出力の系のパラメータと、入力の作り方を決める。
+
+    時定数とむだ時間は、短い試技でも各ステップの間に整定するよう、収録の長さで上限を決める。
+    ステップの時刻は、ステップ応答の答えが厳密になるようサンプルの時刻に合わせる。
+
+    Args:
+        rng: 乱数生成器。
+        t: サンプルの真の時刻 [s]。
+        rate_hz: サンプリング周波数 [Hz]。
+
+    Returns:
+        系の真値。
+    """
+    span = float(t[-1] - t[0])
+    low, high = 2.0, 12.0
+    step_indices = [round(fraction * (t.size - 1)) for fraction in (0.1, 0.2, 0.3, 0.4)]
+    max_time_constant = min(0.03, 0.01 * span)
+    delay_samples = max(1, round(float(rng.uniform(0.005, 0.015)) * rate_hz))
+    return SyntheticIoSystem(
+        gain=float(rng.uniform(0.4, 0.6)),
+        offset=float(rng.uniform(0.5, 1.5)),
+        delay_s=delay_samples / rate_hz,
+        time_constant_s=float(rng.uniform(0.5, 1.0)) * max_time_constant,
+        play_width=0.5,
+        input_noise_std=0.02,
+        output_noise_std=0.01,
+        initial_level=low,
+        step_times_s=[float(t[index]) for index in step_indices],
+        step_levels=[high, low, high, low],
+        triangle_start_s=float(t[round(0.5 * (t.size - 1))]),
+        triangle_period_s=0.25 * span,
+        triangle_low=low,
+        triangle_high=high,
+    )
+
+
+def _io_input(system: SyntheticIoSystem, t: FloatArray) -> FloatArray:
+    """入出力の系の入力（前半はステップ、後半は三角波）を計算する。
+
+    Args:
+        system: 系の真値。
+        t: サンプルの真の時刻 [s]。
+
+    Returns:
+        入力の真値。
+    """
+    values = np.full(t.shape, system.initial_level, dtype=np.float64)
+    for step_time, level in zip(system.step_times_s, system.step_levels, strict=True):
+        values[t >= step_time] = level
+    triangle = t >= system.triangle_start_s
+    phase = np.mod((t[triangle] - system.triangle_start_s) / system.triangle_period_s, 1.0)
+    span = system.triangle_high - system.triangle_low
+    values[triangle] = system.triangle_low + span * (1.0 - np.abs(2.0 * phase - 1.0))
+    return values
+
+
+def evaluate_io_output(
+    system: SyntheticIoSystem, true_input: FloatArray, rate_hz: float
+) -> FloatArray:
+    """入出力の系の、雑音のない出力を計算する（式は SyntheticIoSystem を参照）。
+
+    Args:
+        system: 系の真値。
+        true_input: 入力の真値（等間隔のサンプル）。
+        rate_hz: サンプリング周波数 [Hz]。
+
+    Returns:
+        出力の真値。
+    """
+    half_width = system.play_width / 2.0
+    played = np.empty_like(true_input)
+    state = float(true_input[0]) - half_width  # 最初は増加してきた状態とする
+    for index, value in enumerate(true_input):
+        state = min(max(state, float(value) - half_width), float(value) + half_width)
+        played[index] = state
+    delay_samples = round(system.delay_s * rate_hz)
+    delayed = np.concatenate(
+        [np.full(delay_samples, played[0]), played[: true_input.size - delay_samples]]
+    )
+    # 一次遅れの厳密な離散化: s[k] = a s[k-1] + (1 - a) q[k-1]、a = exp(-Δt/τ)。
+    decay = math.exp(-1.0 / (rate_hz * system.time_constant_s))
+    numerator, denominator = [0.0, 1.0 - decay], [1.0, -decay]
+    initial = signal.lfilter_zi(numerator, denominator) * delayed[0]  # 最初は定常状態
+    lagged, _ = signal.lfilter(numerator, denominator, delayed, zi=initial)
+    return np.asarray(system.offset + system.gain * lagged, dtype=np.float64)
+
+
 def _true_sample_times(start_true_s: float, end_true_s: float, rate_hz: float) -> FloatArray:
     """収録開始から終了まで、等間隔のサンプル時刻（真の時間軸）を返す。
 
@@ -637,7 +797,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return 1
 
-    n_files = sum(len(trial.sources) for trial in manifest.trials)
+    n_files = sum(len(trial.sources) + 1 for trial in manifest.trials)  # + 1 は io_pair.csv
     print(
         f"{args.output} に合成データを生成しました: 試技 {len(manifest.trials)} 件、"
         f"データファイル {n_files} 件、失敗データ {len(manifest.broken_files)} 件"

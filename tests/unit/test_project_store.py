@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -11,9 +12,14 @@ import pytest
 from pydantic import ValidationError
 
 from experiment_workbench.model import (
+    ANALYSIS_FORMAT_VERSION,
     DATASET_TIME_COLUMN,
     PROJECT_FORMAT_VERSION,
     VIEW_FORMAT_VERSION,
+    AnalysisKind,
+    AnalysisSpec,
+    ButterworthKind,
+    ButterworthParams,
     PlotPanelState,
     PlotView,
     Project,
@@ -257,7 +263,7 @@ def test_remove_file_cleans_empty_folder_but_keeps_top_level(project_root: Path)
 def test_view_round_trip(project_root: Path) -> None:
     """表示設定を保存して読み込むと同じ内容になる。"""
     view = PlotView(
-        panels=[PlotPanelState(channel_ids=[uuid4()], y_range=(-1.0, 1.0)), PlotPanelState()],
+        panels=[PlotPanelState(series_ids=[uuid4()], y_range=(-1.0, 1.0)), PlotPanelState()],
         x_range=(10.0, 20.0),
         cursor_time_s=12.5,
     )
@@ -285,3 +291,123 @@ def test_load_view_reports_broken_or_newer_file(project_root: Path) -> None:
         )
         with pytest.raises(SchemaVersionError):
             store.load_view()
+
+
+@pytest.mark.parametrize("explicit_version", [True, False])
+def test_load_view_upgrades_version_1(project_root: Path, *, explicit_version: bool) -> None:
+    """形式 v1 の表示設定（パネルの channel_ids）は、v2 の series_ids に読み替える。
+
+    形式バージョンを書いていない最初期のファイルも v1 として扱う。
+    """
+    channel_id = uuid4()
+    raw: dict[str, object] = {"panels": [{"channel_ids": [str(channel_id)], "y_range": [0, 1]}]}
+    if explicit_version:
+        raw["format_version"] = 1
+    (project_root / ProjectDirectory.VIEWS / "main.json").write_text(
+        json.dumps(raw), encoding="utf-8"
+    )
+    with ProjectStore.open(project_root) as store:
+        view = store.load_view()
+    assert view is not None
+    assert view.format_version == VIEW_FORMAT_VERSION
+    assert view.panels == [PlotPanelState(series_ids=[channel_id], y_range=(0.0, 1.0))]
+
+
+# --- 保存した解析と計算結果のキャッシュ -----------------------------------------
+
+
+def _lowpass_spec(name: str, created_at: datetime) -> AnalysisSpec:
+    """保存のテストに使う低域通過フィルタの解析を作る。
+
+    Args:
+        name: 解析の名前。
+        created_at: 作成日時（読み込み順の確認に使う）。
+
+    Returns:
+        解析。
+    """
+    return AnalysisSpec(
+        name=name,
+        created_at=created_at,
+        input_channel_id=uuid4(),
+        kind=AnalysisKind.BUTTERWORTH,
+        butterworth=ButterworthParams(kind=ButterworthKind.LOWPASS, cutoff_hz=10.0),
+    )
+
+
+def test_analyses_round_trip_in_creation_order(project_root: Path) -> None:
+    """保存した解析は作成日時の順に読み込め、同じ ID で保存し直すと置き換わる。"""
+    older = _lowpass_spec("older", datetime(2026, 1, 1, tzinfo=UTC))
+    newer = _lowpass_spec("newer", datetime(2026, 1, 2, tzinfo=UTC))
+    with ProjectStore.open(project_root) as store:
+        assert store.load_analyses() == ([], [])
+        store.save_analysis(newer)
+        store.save_analysis(older)
+        assert store.load_analyses() == ([older, newer], [])
+        renamed = older.model_copy(update={"name": "renamed"})
+        store.save_analysis(renamed)
+        specs, problems = store.load_analyses()
+    assert specs == [renamed, newer]
+    assert problems == []
+
+
+def test_load_analyses_skips_broken_and_newer_files_with_reason(project_root: Path) -> None:
+    """壊れた・新しい形式の解析ファイルは飛ばして理由を返し、他の解析は読み込む。"""
+    spec = _lowpass_spec("ok", datetime(2026, 1, 1, tzinfo=UTC))
+    pipelines = project_root / ProjectDirectory.PIPELINES
+    with ProjectStore.open(project_root) as store:
+        store.save_analysis(spec)
+        (pipelines / "broken.json").write_text("{broken", encoding="utf-8")
+        newer = json.loads(spec.model_copy(update={"id": uuid4()}).model_dump_json())
+        newer["format_version"] = ANALYSIS_FORMAT_VERSION + 1
+        newer["future_field"] = True
+        (pipelines / "newer.json").write_text(json.dumps(newer), encoding="utf-8")
+        specs, problems = store.load_analyses()
+    assert specs == [spec]
+    assert len(problems) == 2
+    assert any("broken.json" in problem for problem in problems)
+    assert any("newer.json" in problem and "新しい形式" in problem for problem in problems)
+
+
+def test_derived_cache_keeps_only_latest_fingerprint(project_root: Path) -> None:
+    """計算結果のキャッシュは指紋ごとに読み書きでき、条件が変わると古いキャッシュを消す。"""
+    analysis_id = uuid4()
+    first = pl.DataFrame({DATASET_TIME_COLUMN: [0.0, 1.0], "output": [1.0, 2.0]})
+    second = pl.DataFrame({DATASET_TIME_COLUMN: [0.0, 1.0], "output": [3.0, 4.0]})
+    cache_dir = project_root / ProjectDirectory.DERIVED / str(analysis_id)
+    with ProjectStore.open(project_root) as store:
+        assert store.load_derived(analysis_id, "aaaa") is None
+        store.save_derived(analysis_id, "aaaa", first)
+        loaded = store.load_derived(analysis_id, "aaaa")
+        assert loaded is not None
+        assert loaded.equals(first)
+        store.save_derived(analysis_id, "bbbb", second)
+        assert store.load_derived(analysis_id, "aaaa") is None
+        assert sorted(path.name for path in cache_dir.iterdir()) == ["bbbb.parquet"]
+
+
+def test_broken_derived_cache_is_treated_as_missing(project_root: Path) -> None:
+    """読めないキャッシュはエラーにせず、ないものとして扱う（再計算させる）。"""
+    analysis_id = uuid4()
+    cache_dir = project_root / ProjectDirectory.DERIVED / str(analysis_id)
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "aaaa.parquet").write_bytes(b"not parquet")
+    with ProjectStore.open(project_root) as store:
+        assert store.load_derived(analysis_id, "aaaa") is None
+
+
+def test_delete_analysis_removes_spec_and_cache_but_not_others(project_root: Path) -> None:
+    """解析を削除すると条件のファイルとキャッシュが消え、他の解析は残る。"""
+    removed = _lowpass_spec("removed", datetime(2026, 1, 1, tzinfo=UTC))
+    kept = _lowpass_spec("kept", datetime(2026, 1, 2, tzinfo=UTC))
+    frame = pl.DataFrame({DATASET_TIME_COLUMN: [0.0], "output": [1.0]})
+    derived = project_root / ProjectDirectory.DERIVED
+    with ProjectStore.open(project_root) as store:
+        for spec in (removed, kept):
+            store.save_analysis(spec)
+            store.save_derived(spec.id, "aaaa", frame)
+        store.delete_analysis(removed.id)
+        assert store.load_analyses() == ([kept], [])
+        store.delete_analysis(uuid4())  # 存在しない解析を削除してもエラーにしない
+    assert not (derived / str(removed.id)).exists()
+    assert (derived / str(kept.id) / "aaaa.parquet").is_file()

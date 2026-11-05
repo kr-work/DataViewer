@@ -25,18 +25,22 @@ import hashlib
 import io
 import json
 import re
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
+from uuid import UUID
 
 import numpy as np
 import polars as pl
 from pydantic import ValidationError
 
 from experiment_workbench.model import (
+    ANALYSIS_FORMAT_VERSION,
     DATASET_TIME_COLUMN,
     PROJECT_FORMAT_VERSION,
     VIEW_FORMAT_VERSION,
+    AnalysisSpec,
     Channel,
     ChannelData,
     PlotView,
@@ -328,16 +332,110 @@ class ProjectStore:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ProjectStoreError(f"{path} を JSON として読み込めません: {exc}") from exc
-        version = raw.get("format_version") if isinstance(raw, dict) else None
+        version = raw.get("format_version", 1) if isinstance(raw, dict) else None
         if isinstance(version, int) and version > VIEW_FORMAT_VERSION:
             raise SchemaVersionError(
                 f"{path} の形式バージョン {version} は、このアプリが扱えるバージョン "
                 f"{VIEW_FORMAT_VERSION} より新しいため開けません"
             )
+        if isinstance(raw, dict) and version == 1:
+            raw = _upgrade_view_v1(raw)
         try:
             return PlotView.model_validate(raw)
         except ValidationError as exc:
             raise ProjectStoreError(f"{path} の内容が不正です:\n{exc}") from exc
+
+    # --- 保存した解析と計算結果のキャッシュ ----------------------------------------
+
+    def save_analysis(self, spec: AnalysisSpec) -> None:
+        """解析の条件を pipelines/<ID>.json に保存する（同じ ID のファイルは置き換える）。
+
+        Args:
+            spec: 保存する解析。
+        """
+        path = self.directory(ProjectDirectory.PIPELINES) / f"{spec.id}.json"
+        data = (spec.model_dump_json(indent=2) + "\n").encode("utf-8")
+        _write_bytes_atomically(path, data, overwrite=True)
+
+    def load_analyses(self) -> tuple[list[AnalysisSpec], list[str]]:
+        """保存されている解析をすべて読み込む（作成日時の順）。
+
+        1 つのファイルが壊れていても他の解析は使えるよう、読めないファイルは飛ばして
+        理由を返す（黙って捨てない）。
+
+        Returns:
+            (解析のリスト, 読めなかったファイルの説明のリスト)。
+        """
+        specs: list[AnalysisSpec] = []
+        problems: list[str] = []
+        for path in sorted(self.directory(ProjectDirectory.PIPELINES).glob("*.json")):
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                version = raw.get("format_version") if isinstance(raw, dict) else None
+                if isinstance(version, int) and version > ANALYSIS_FORMAT_VERSION:
+                    problems.append(f"{path.name} はこのアプリより新しい形式のため読み込みません")
+                    continue
+                specs.append(AnalysisSpec.model_validate(raw))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValidationError) as exc:
+                # OSError: 他のアプリが開いている・権限がないなど。1 つのファイルのために
+                # プロジェクト全体を開けなくしないよう、他の読めない理由と同じく飛ばして知らせる。
+                problems.append(f"{path.name} を読み込めません: {exc}")
+        specs.sort(key=_created_at)
+        return specs, problems
+
+    def delete_analysis(self, analysis_id: UUID) -> None:
+        """解析の条件と、その計算結果のキャッシュを削除する（生データは変更しない）。
+
+        Args:
+            analysis_id: 削除する解析の ID。
+        """
+        (self.directory(ProjectDirectory.PIPELINES) / f"{analysis_id}.json").unlink(missing_ok=True)
+        cache_dir = self.directory(ProjectDirectory.DERIVED) / str(analysis_id)
+        if cache_dir.is_dir():
+            for cache_file in cache_dir.glob("*.parquet"):
+                cache_file.unlink()
+            if not any(cache_dir.iterdir()):
+                cache_dir.rmdir()
+
+    def save_derived(self, analysis_id: UUID, fingerprint: str, frame: pl.DataFrame) -> None:
+        """解析の計算結果をキャッシュとして derived/<解析 ID>/<指紋>.parquet に保存する。
+
+        同じ解析の、条件が違う（指紋が違う）古いキャッシュは使われないので削除する。
+
+        Args:
+            analysis_id: 解析の ID。
+            fingerprint: 計算結果を決める条件の指紋（runner.analysis_fingerprint）。
+            frame: 計算結果の表（runner.result_to_frame）。
+        """
+        cache_dir = self.directory(ProjectDirectory.DERIVED) / str(analysis_id)
+        target = cache_dir / f"{fingerprint}.parquet"
+        if cache_dir.is_dir():
+            for old in cache_dir.glob("*.parquet"):
+                if old != target:
+                    old.unlink()
+        buffer = io.BytesIO()
+        frame.write_parquet(buffer)
+        _write_bytes_atomically(target, buffer.getvalue(), overwrite=True)
+
+    def load_derived(self, analysis_id: UUID, fingerprint: str) -> pl.DataFrame | None:
+        """解析の計算結果のキャッシュを読み込む。
+
+        Args:
+            analysis_id: 解析の ID。
+            fingerprint: 計算結果を決める条件の指紋。
+
+        Returns:
+            計算結果の表。キャッシュがない、または読めない場合は None（再計算させる）。
+        """
+        path = (
+            self.directory(ProjectDirectory.DERIVED) / str(analysis_id) / f"{fingerprint}.parquet"
+        )
+        if not path.is_file():
+            return None
+        try:
+            return pl.read_parquet(path)
+        except (OSError, pl.exceptions.PolarsError):
+            return None
 
     # --- 接続管理 ------------------------------------------------------------
 
@@ -386,6 +484,42 @@ def _write_project_file(root: Path, project: Project) -> None:
     """
     data = (project.model_dump_json(indent=2) + "\n").encode("utf-8")
     _write_bytes_atomically(root / PROJECT_FILE_NAME, data, overwrite=True)
+
+
+def _upgrade_view_v1(raw: dict[str, object]) -> dict[str, object]:
+    """表示設定の形式 v1 を v2 に変換する（パネルの channel_ids を series_ids に改名する）。
+
+    Phase 3 で解析の出力もパネルに置けるようにしたため、項目名を一般化した。
+
+    Args:
+        raw: v1 の表示設定（JSON を読み込んだ辞書）。
+
+    Returns:
+        v2 の表示設定の辞書。
+    """
+    upgraded = dict(raw)
+    panels = raw.get("panels", [])
+    if isinstance(panels, list):
+        upgraded["panels"] = [
+            {("series_ids" if key == "channel_ids" else key): value for key, value in panel.items()}
+            if isinstance(panel, dict)
+            else panel
+            for panel in panels
+        ]
+    upgraded["format_version"] = VIEW_FORMAT_VERSION
+    return upgraded
+
+
+def _created_at(spec: AnalysisSpec) -> datetime:
+    """解析の作成日時を返す（並べ替えのキー用）。
+
+    Args:
+        spec: 解析。
+
+    Returns:
+        作成日時。
+    """
+    return spec.created_at
 
 
 def _write_bytes_atomically(path: Path, data: bytes, *, overwrite: bool) -> None:

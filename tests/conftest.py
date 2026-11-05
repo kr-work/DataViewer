@@ -5,6 +5,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from PySide6.QtCore import QSettings
 
 from experiment_workbench.model import (
     Channel,
@@ -25,6 +26,7 @@ from experiment_workbench.model import (
 )
 from experiment_workbench.storage import ProjectStore
 from experiment_workbench.synthetic import SyntheticDataGenerator
+from experiment_workbench.ui.main_window import WORKSPACE_ROOT_KEY, application_settings
 
 # GUI のテスト（pytest-qt）で画面を出さない。QApplication が作られる前に設定する必要がある。
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -34,6 +36,26 @@ Hierarchy = tuple[Experiment, Session, Trial, Source, Channel, Event]
 
 SyntheticDataset = tuple[Path, SyntheticManifest]
 """(合成データの出力ディレクトリ, 目録) の組。"""
+
+
+@pytest.fixture(autouse=True)
+def isolated_settings(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """ウィンドウの配置などの保存先と、ファイルごとの自動の保存先を、テストごとの一時フォルダにする。
+
+    利用者の設定とデータをテストで変えないため。テストごとに分けるのは、前のテストが保存したドックの
+    幅などに次のテストの結果が左右されないようにするため。
+
+    Args:
+        tmp_path_factory: pytest の一時ディレクトリ生成器。
+
+    Returns:
+        設定の保存先のフォルダ。
+    """
+    folder = tmp_path_factory.mktemp("settings")
+    QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+    QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, str(folder))
+    application_settings().setValue(WORKSPACE_ROOT_KEY, str(folder / "workspaces"))
+    return folder
 
 
 @pytest.fixture

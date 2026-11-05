@@ -8,31 +8,45 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from experiment_workbench.model import (
+    ANALYSIS_FORMAT_VERSION,
     DATASET_TIME_COLUMN,
     AdaptiveNoiseMethod,
     AdaptiveNoiseParams,
+    AlignmentGrid,
+    AlignmentParams,
+    AnalysisKind,
+    AnalysisSpec,
     ButterworthKind,
     ButterworthParams,
     ChannelData,
+    ChartSeries,
+    CrossCorrelationParams,
     DataIssue,
     DataIssueKind,
     DerivativeMethod,
     DerivativeParams,
     Event,
     Experiment,
+    HysteresisParams,
     ImportRequest,
     IntegralParams,
     IssueSeverity,
     KalmanInitialState,
+    KalmanModelKind,
     KalmanResult,
+    KalmanSettings,
     KinematicSystemParams,
     LinearSystemParams,
     MovingAverageParams,
+    OnsetThresholdMode,
+    PlotSeries,
     PlotView,
+    PolynomialObservationParams,
     Project,
     ReadOptions,
     SavitzkyGolayParams,
     Source,
+    StepResponseParams,
     SyntheticConfig,
     SyntheticMotion,
     TimeAxisKind,
@@ -449,3 +463,301 @@ def test_channel_data_rejects_inconsistent_arrays(
         ChannelData.model_validate(
             {"channel": channel, "source": source, "time_s": time_s, "values": values}
         )
+
+
+# --- 保存できる解析と表示用の系列（Phase 3） ---------------------------------------
+
+_INITIAL_2 = {"state": [0.0, 0.0], "covariance": [[1.0, 0.0], [0.0, 1.0]]}
+"""2 次元の状態の初期状態（テスト用）。"""
+_KINEMATIC = {"process_noise_density": 1.0, "measurement_noise_std": 0.1}
+"""運動学モデルの条件（テスト用）。"""
+_LINEAR = {
+    "transition": [[1.0, 0.01], [0.0, 1.0]],
+    "observation": [[1.0, 0.0]],
+    "process_noise": [[1e-4, 0.0], [0.0, 1e-2]],
+    "measurement_noise": [[0.01]],
+}
+"""線形モデルの条件（テスト用）。"""
+_POLYNOMIAL = {
+    "process_noise_density": 1.0,
+    "measurement_noise_std": 0.1,
+    "coefficients": [0.5, 2.0, 0.1],
+}
+"""多項式の観測モデルの条件（テスト用）。"""
+
+
+@pytest.mark.parametrize(
+    ("model_kind", "params"),
+    [
+        (KalmanModelKind.KINEMATIC, {"kinematic": _KINEMATIC}),
+        (KalmanModelKind.LINEAR, {"linear": _LINEAR}),
+        (KalmanModelKind.POLYNOMIAL_OBSERVATION, {"polynomial_observation": _POLYNOMIAL}),
+    ],
+)
+def test_kalman_settings_accept_selected_model(
+    model_kind: KalmanModelKind, params: dict[str, object]
+) -> None:
+    """選んだモデルの条件だけを指定したカルマンフィルタの条件は受け付け、JSON で往復できる。"""
+    settings = KalmanSettings.model_validate(
+        {"model_kind": model_kind, "initial": _INITIAL_2} | params
+    )
+    assert KalmanSettings.model_validate_json(settings.model_dump_json()) == settings
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {},  # 選んだモデルの条件がない
+        {"linear": _LINEAR},  # 別のモデルの条件だけがある
+        {"kinematic": _KINEMATIC, "linear": _LINEAR},  # 使わない条件も指定されている
+    ],
+)
+def test_kalman_settings_reject_missing_or_extra_model(params: dict[str, object]) -> None:
+    """選んだモデルの条件がない、または使わないモデルの条件もある場合は拒否する。
+
+    使わない条件を受け付けると、保存された内容から実際に使った条件を読み違えるため。
+    """
+    with pytest.raises(ValidationError, match="条件だけを指定"):
+        KalmanSettings.model_validate(
+            {"model_kind": KalmanModelKind.KINEMATIC, "initial": _INITIAL_2} | params
+        )
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"coefficients": [1.0]},  # 定数だけでは状態を観測できない
+        {"coefficients": [0.0, math.inf]},
+        {"derivative_order": 3},
+        {"measurement_noise_std": 0.0},
+    ],
+)
+def test_polynomial_observation_params_reject_invalid_values(changes: dict[str, object]) -> None:
+    """多項式の観測モデルの係数は 2 つ以上の有限値、微分の階数は 1〜2、雑音は正であること。"""
+    with pytest.raises(ValidationError):
+        PolynomialObservationParams.model_validate(_POLYNOMIAL | changes)
+
+
+def test_analysis_spec_round_trips_with_kalman_settings() -> None:
+    """カルマンフィルタの解析は、ID・作成日時・条件を含めて JSON で往復できる。"""
+    spec = AnalysisSpec(
+        name="張力の推定",
+        input_channel_id=uuid4(),
+        kind=AnalysisKind.KALMAN,
+        kalman=KalmanSettings.model_validate(
+            {
+                "model_kind": KalmanModelKind.POLYNOMIAL_OBSERVATION,
+                "polynomial_observation": _POLYNOMIAL,
+                "initial": _INITIAL_2,
+                "adaptive": {"method": AdaptiveNoiseMethod.SAGE_HUSA},
+            }
+        ),
+    )
+    restored = AnalysisSpec.model_validate_json(spec.model_dump_json())
+    assert restored == spec
+    assert restored.format_version == ANALYSIS_FORMAT_VERSION
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {},
+        {"moving_average": {"window_samples": 5}},
+        {"butterworth": {"kind": ButterworthKind.LOWPASS, "cutoff_hz": 10.0}, "integral": {}},
+    ],
+)
+def test_analysis_spec_requires_only_selected_params(params: dict[str, object]) -> None:
+    """解析の条件は、選んだ種類（ここではバターワースフィルタ）のものだけを指定する。"""
+    with pytest.raises(ValidationError, match="条件だけを指定"):
+        AnalysisSpec.model_validate(
+            {"name": "LPF", "input_channel_id": uuid4(), "kind": AnalysisKind.BUTTERWORTH} | params
+        )
+
+
+def test_analysis_spec_name_must_not_be_blank() -> None:
+    """解析の名前は空にできない（ツリーや凡例で区別できなくなるため）。"""
+    with pytest.raises(ValidationError):
+        AnalysisSpec.model_validate(
+            {
+                "name": " ",
+                "input_channel_id": uuid4(),
+                "kind": AnalysisKind.INTEGRAL,
+                "integral": {},
+            }
+        )
+
+
+def _plot_series_fields(hierarchy: Hierarchy) -> dict[str, object]:
+    """表示用の系列の、正しい項目一式を返す（異常系テストで一部を差し替える）。
+
+    Args:
+        hierarchy: テスト用のエンティティ。
+
+    Returns:
+        PlotSeries の項目の辞書。
+    """
+    values = np.linspace(0.0, 1.0, 5)
+    return {
+        "series_id": uuid4(),
+        "label": "推定値",
+        "source": hierarchy[3],
+        "time_s": np.arange(5.0),
+        "values": values,
+        "band_lower": values - 0.1,
+        "band_upper": values + 0.1,
+        "marker_times_s": np.array([1.0, 3.0]),
+    }
+
+
+def test_plot_series_accepts_band_and_markers(hierarchy: Hierarchy) -> None:
+    """帯（下端・上端）と印の時刻を持つ表示用の系列を作れる。"""
+    series = PlotSeries.model_validate(_plot_series_fields(hierarchy))
+    assert series.band_lower is not None
+    assert series.analysis_id is None
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"band_upper": None}, "組で"),
+        ({"band_lower": np.zeros(4)}, "band_lower"),
+        ({"band_upper": np.zeros(5, dtype=np.float32)}, "band_upper"),
+        ({"marker_times_s": np.zeros((2, 1))}, "marker_times_s"),
+        ({"values": np.zeros(4)}, r"."),
+    ],
+)
+def test_plot_series_rejects_inconsistent_arrays(
+    hierarchy: Hierarchy, changes: dict[str, object], message: str
+) -> None:
+    """帯の片方だけ・値と形の違う帯・2 次元の印・長さの違う値は拒否する。"""
+    with pytest.raises(ValidationError, match=message):
+        PlotSeries.model_validate(_plot_series_fields(hierarchy) | changes)
+
+
+# --- 入出力関係の解析（Phase 4） ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"grid": AlignmentGrid.UNIFORM}, "サンプリング周波数を指定"),
+        ({"uniform_rate_hz": 100.0}, "等間隔の時刻に対応付けるときだけ"),
+        ({"start_s": 2.0, "end_s": 1.0}, "範囲の開始"),
+        ({"max_gap_factor": 1.0}, r"."),
+    ],
+)
+def test_alignment_params_reject_inconsistent_settings(
+    changes: dict[str, object], message: str
+) -> None:
+    """等間隔の周波数の指定漏れ・余分な指定、逆向きの範囲、1 以下の欠損の倍率は拒否する。"""
+    with pytest.raises(ValidationError, match=message):
+        AlignmentParams.model_validate(changes)
+
+
+def test_alignment_params_require_finite_offset() -> None:
+    """時刻オフセットは有限の値でなければならない。"""
+    with pytest.raises(ValidationError):
+        AlignmentParams(output_time_offset_s=math.nan)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"onset_threshold": 1.0},  # 割合は 1 未満
+        {"onset_threshold": 0.0},
+        {"baseline_fraction": 0.5},
+        {"final_fraction": 0.0},
+        {"settling_band": 1.0},
+    ],
+)
+def test_step_response_params_reject_out_of_range(changes: dict[str, object]) -> None:
+    """しきい値の割合・平均の区間の割合・整定の幅は、意味のある範囲でなければならない。"""
+    with pytest.raises(ValidationError):
+        StepResponseParams.model_validate(changes)
+
+
+def test_step_response_absolute_threshold_may_exceed_one() -> None:
+    """入力の単位で指定するしきい値は、1 以上でもよい。"""
+    params = StepResponseParams(onset_mode=OnsetThresholdMode.ABSOLUTE, onset_threshold=5.0)
+    assert params.onset_threshold == 5.0
+
+
+def test_cross_correlation_params_require_ordered_lags() -> None:
+    """遅れを探す範囲の下限は上限より小さくなければならない。"""
+    with pytest.raises(ValidationError, match="下限"):
+        CrossCorrelationParams(min_lag_s=0.5, max_lag_s=0.5)
+
+
+@pytest.mark.parametrize(
+    ("kind", "params"),
+    [
+        (AnalysisKind.STEP_RESPONSE, {"step_response": {}}),
+        (AnalysisKind.HYSTERESIS, {"hysteresis": {}}),
+        (AnalysisKind.CROSS_CORRELATION, {"cross_correlation": {"min_lag_s": -1, "max_lag_s": 1}}),
+    ],
+)
+def test_two_channel_analysis_needs_output_channel_and_alignment(
+    kind: AnalysisKind, params: dict[str, object]
+) -> None:
+    """2 チャンネルの解析には、出力チャンネルと対応付けの条件が必要で、JSON で往復できる。"""
+    base = {"name": "応答", "input_channel_id": uuid4(), "kind": kind} | params
+    with pytest.raises(ValidationError, match="出力チャンネル"):
+        AnalysisSpec.model_validate(base)
+    spec = AnalysisSpec.model_validate(base | {"output_channel_id": uuid4(), "alignment": {}})
+    assert AnalysisSpec.model_validate_json(spec.model_dump_json()) == spec
+
+
+def test_two_channel_analysis_rejects_same_channel() -> None:
+    """入力と出力に同じチャンネルは指定できない。"""
+    channel = uuid4()
+    with pytest.raises(ValidationError, match="同じチャンネル"):
+        AnalysisSpec(
+            name="応答",
+            input_channel_id=channel,
+            output_channel_id=channel,
+            kind=AnalysisKind.HYSTERESIS,
+            alignment=AlignmentParams(),
+            hysteresis=HysteresisParams(),
+        )
+
+
+def test_single_channel_analysis_rejects_output_channel() -> None:
+    """1 チャンネルの解析には、出力チャンネルや対応付けの条件を指定できない。"""
+    with pytest.raises(ValidationError, match="2 チャンネルを使う解析にだけ"):
+        AnalysisSpec(
+            name="積分",
+            input_channel_id=uuid4(),
+            output_channel_id=uuid4(),
+            kind=AnalysisKind.INTEGRAL,
+            integral=IntegralParams(),
+        )
+
+
+def test_version_1_analysis_is_still_readable() -> None:
+    """2 チャンネルの項目がない形式 v1 の解析も、そのまま読める。"""
+    spec = AnalysisSpec.model_validate(
+        {
+            "format_version": 1,
+            "name": "積分",
+            "input_channel_id": str(uuid4()),
+            "kind": "integral",
+            "integral": {},
+        }
+    )
+    assert spec.output_channel_id is None
+    assert spec.alignment is None
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"y": np.zeros(4)}, "長さ"),
+        ({"x": np.zeros(5, dtype=np.float32)}, "float64"),
+        ({"color": "red"}, r"."),
+    ],
+)
+def test_chart_series_rejects_invalid_values(changes: dict[str, object], message: str) -> None:
+    """グラフの系列は、同じ長さの float64 の配列と "#rrggbb" の色でなければならない。"""
+    fields = {"label": "系列", "x": np.zeros(5), "y": np.zeros(5)}
+    with pytest.raises(ValidationError, match=message):
+        ChartSeries.model_validate(fields | changes)

@@ -23,6 +23,9 @@ FloatArray = np.ndarray[tuple[int, ...], np.dtype[np.float64]]
 BoolArray = np.ndarray[tuple[int, ...], np.dtype[np.bool_]]
 """bool の NumPy 配列（形は問わない）。"""
 
+IntArray = np.ndarray[tuple[int, ...], np.dtype[np.intp]]
+"""整数（配列の番号）の NumPy 配列（形は問わない）。"""
+
 NON_BLANK_PATTERN = r"\S"
 """空白以外の文字を 1 つ以上含むことを表す正規表現（pydantic の ``Field(pattern=...)`` 用）。
 
@@ -35,6 +38,9 @@ SHA256_PATTERN = r"^[0-9a-f]{64}$"
 
 VIEW_NAME_PATTERN = r"^[A-Za-z0-9_-]+$"
 """表示設定の名前（views/<名前>.json のファイル名に使うため、英数字・"_"・"-" に限る）。"""
+
+COLOR_PATTERN = r"^#[0-9A-Fa-f]{6}$"
+"""色の指定（"#rrggbb" の 16 進表記）。"""
 
 # 行列の対称性・正定値性の判定に使う許容誤差。保存した JSON の丸め誤差程度は許す。
 _SYMMETRY_RTOL = 1e-9
@@ -225,6 +231,56 @@ def check_series_arrays(time_s: FloatArray, values: FloatArray) -> None:
             )
     if time_s.shape != values.shape:
         raise ValueError(f"時刻の長さ {time_s.shape[0]} と値の長さ {values.shape[0]} が違います")
+
+
+def check_selected_settings(*, selected: str, provided: list[str]) -> None:
+    """種類を選んで条件を指定するモデルで、選んだ種類の条件だけが指定されていることを確認する。
+
+    使わない条件を受け付けると、保存された内容から実際に使った条件を読み違えるため拒否する。
+
+    Args:
+        selected: 選んだ種類（条件の項目名と同じ文字列）。
+        provided: 指定されていた（None でない）条件の項目名。
+
+    Raises:
+        ValueError: 選んだ種類の条件がない、または他の種類の条件も指定されている場合。
+    """
+    if provided != [selected]:
+        raise ValueError(
+            f"種類 {selected!r} の条件だけを指定してください（指定されていた条件: {provided}）"
+        )
+
+
+def check_plot_series_arrays(
+    time_s: FloatArray,
+    values: FloatArray,
+    band_lower: FloatArray | None,
+    band_upper: FloatArray | None,
+    marker_times_s: FloatArray | None,
+) -> None:
+    """表示用の系列の配列（時刻・値・帯・印）の dtype と形が整合していることを確認する。
+
+    Args:
+        time_s: 時刻 [s]。
+        values: 値。
+        band_lower: 帯の下端（なければ None）。
+        band_upper: 帯の上端（なければ None）。
+        marker_times_s: 印を付ける時刻（なければ None）。
+
+    Raises:
+        ValueError: 時刻と値が不整合、帯の片方だけが指定されている、帯の形が値と違う、
+            または印の時刻が float64 の 1 次元配列でない場合。
+    """
+    check_series_arrays(time_s, values)
+    if (band_lower is None) != (band_upper is None):
+        raise ValueError("帯の下端と上端は組で指定してください")
+    for name, band in (("band_lower", band_lower), ("band_upper", band_upper)):
+        if band is not None and (band.dtype != np.float64 or band.shape != values.shape):
+            raise ValueError(f"{name} は値と同じ形の float64 の配列にしてください")
+    if marker_times_s is not None and (
+        marker_times_s.dtype != np.float64 or marker_times_s.ndim != 1
+    ):
+        raise ValueError("marker_times_s は float64 の 1 次元配列にしてください")
 
 
 def check_time_column_consistency(*, has_time_column: bool, is_sample_index: bool) -> None:
@@ -503,3 +559,114 @@ def check_kalman_result_arrays(
     for name, actual, expected in expected_shapes:
         if actual != expected:
             raise ValueError(f"{name} の形が {actual} です（期待: {expected}）")
+
+
+# ---------------------------------------------------------------------------
+# 入出力関係の解析と、解析結果の表示の検証（Phase 4）
+# ---------------------------------------------------------------------------
+
+
+def check_alignment_settings(
+    *, uniform: bool, uniform_rate_hz: float | None, start_s: float | None, end_s: float | None
+) -> None:
+    """2 チャンネルの対応付けの条件の組み合わせを確認する。
+
+    Args:
+        uniform: 等間隔の時刻に対応付けるなら True。
+        uniform_rate_hz: 等間隔の時刻のサンプリング周波数 [Hz]（等間隔でなければ None）。
+        start_s: 解析する範囲の開始時刻 [s]（指定しなければ None）。
+        end_s: 解析する範囲の終了時刻 [s]（指定しなければ None）。
+
+    Raises:
+        ValueError: 等間隔なのに周波数がない、等間隔でないのに周波数がある
+            （どちらの時刻を使ったか曖昧になるため）、または範囲の開始が終了以降の場合。
+    """
+    if uniform and uniform_rate_hz is None:
+        raise ValueError("等間隔の時刻に対応付けるときは、サンプリング周波数を指定してください")
+    if not uniform and uniform_rate_hz is not None:
+        raise ValueError(
+            "サンプリング周波数は、等間隔の時刻に対応付けるときだけ指定してください"
+            "（入力・出力の時刻を使う場合は不要です）"
+        )
+    if start_s is not None and end_s is not None and start_s >= end_s:
+        raise ValueError(f"範囲の開始 {start_s} s が終了 {end_s} s 以降になっています")
+
+
+def check_onset_threshold(*, fraction_mode: bool, threshold: float) -> None:
+    """ステップ応答の、変化の開始を判定するしきい値を確認する。
+
+    Args:
+        fraction_mode: しきい値を変化量に対する割合で指定するなら True。
+        threshold: しきい値（正の値であることはモデルの型で確認済み）。
+
+    Raises:
+        ValueError: 割合で指定しているのに 1 以上の場合（変化が終わるまで判定できないため）。
+    """
+    if fraction_mode and threshold >= 1.0:
+        raise ValueError(f"割合のしきい値は 1 未満にしてください（実際: {threshold}）")
+
+
+def check_lag_range(min_lag_s: float, max_lag_s: float) -> None:
+    """相互相関で遅れを探す範囲を確認する。
+
+    Args:
+        min_lag_s: 探す範囲の下限 [s]。
+        max_lag_s: 探す範囲の上限 [s]。
+
+    Raises:
+        ValueError: 下限が上限以上の場合。
+    """
+    if min_lag_s >= max_lag_s:
+        raise ValueError(
+            f"遅れを探す範囲の下限 {min_lag_s} s が、上限 {max_lag_s} s 以上になっています"
+        )
+
+
+def check_two_channel_settings(
+    *, two_channel: bool, has_output_channel: bool, has_alignment: bool, same_channel: bool
+) -> None:
+    """解析の種類と、出力チャンネル・対応付けの条件の指定が合っていることを確認する。
+
+    Args:
+        two_channel: 入力と出力の 2 チャンネルを使う種類なら True。
+        has_output_channel: 出力チャンネルが指定されていれば True。
+        has_alignment: 対応付けの条件が指定されていれば True。
+        same_channel: 入力と出力に同じチャンネルが指定されていれば True。
+
+    Raises:
+        ValueError: 2 チャンネルの解析で出力チャンネルか対応付けの条件がない、
+            入力と出力が同じチャンネル、または 1 チャンネルの解析で指定されている場合
+            （使わない条件を残すと、保存した内容を読み違えるため）。
+    """
+    if two_channel:
+        if not has_output_channel or not has_alignment:
+            raise ValueError(
+                "入力と出力の 2 チャンネルを使う解析には、出力チャンネルと"
+                "時刻の対応付けの条件が必要です"
+            )
+        if same_channel:
+            raise ValueError("入力と出力に同じチャンネルは指定できません")
+    elif has_output_channel or has_alignment:
+        raise ValueError(
+            "出力チャンネルと時刻の対応付けの条件は、2 チャンネルを使う解析にだけ指定してください"
+        )
+
+
+def check_xy_arrays(x: FloatArray, y: FloatArray) -> None:
+    """グラフの系列の X と Y が、同じ長さの float64 の 1 次元配列であることを確認する。
+
+    Args:
+        x: X 座標。
+        y: Y 座標。
+
+    Raises:
+        ValueError: dtype・次元・長さが条件を満たさない場合。
+    """
+    for name, array in (("x", x), ("y", y)):
+        if array.dtype != np.float64 or array.ndim != 1:
+            raise ValueError(
+                f"{name} は float64 の 1 次元配列にしてください"
+                f"（実際: {array.dtype}、{array.ndim} 次元）"
+            )
+    if x.shape != y.shape:
+        raise ValueError(f"x の長さ {x.shape[0]} と y の長さ {y.shape[0]} が違います")

@@ -1,8 +1,10 @@
-"""データファイルの取り込みダイアログ（SPEC F-02）。
+"""データファイルの読み込み設定の確認ダイアログ（SPEC F-02）。
 
-ファイルのプレビューと、読み込み前に分かる異常を表示しながら、時刻列・チャンネル・登録先・
-時刻の同期の有無を選ぶ。選んだ内容は ImportRequest（pydantic モデル）にまとめ、検証エラーは
-ダイアログ内に表示して閉じない。ファイルの検証・コピー・登録は呼び出し側（メイン画面）が行う。
+普段はファイルの中身から読み方を自動で判定するので、このダイアログは出ない。判定できないとき、
+または利用者が求めたときだけ、確認が必要な理由とプレビューを見せて、時刻列とチャンネルを選んで
+もらう。読み方の詳細と登録先の名前は、普段は触らなくてよいので畳んでおく。
+選んだ内容は ImportRequest（pydantic モデル）にまとめ、検証エラーはダイアログ内に表示して
+閉じない。ファイルの検証・コピー・登録は呼び出し側（メイン画面）が行う。
 """
 
 from pathlib import Path
@@ -20,6 +22,8 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
+    QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
@@ -31,7 +35,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from experiment_workbench.importer import DataImporter
+from experiment_workbench.importer import (
+    DataImporter,
+    file_format_of,
+    guess_time_column,
+    parse_time_unit,
+)
 from experiment_workbench.model import (
     DATASET_TIME_COLUMN,
     ChannelImportSpec,
@@ -39,6 +48,7 @@ from experiment_workbench.model import (
     Experiment,
     FilePreview,
     ImportRequest,
+    ImportSuggestion,
     IssueSeverity,
     ReadOptions,
     Session,
@@ -46,6 +56,7 @@ from experiment_workbench.model import (
     TimeUnit,
     Trial,
 )
+from experiment_workbench.ui.analysis_panel import CollapsibleSection
 
 NO_TIME_COLUMN_LABEL = "（時刻列なし: サンプル番号とサンプル間隔から作る）"
 """時刻列の選択肢のうち、「時刻列を使わない」を表す表示。"""
@@ -68,7 +79,7 @@ _WARNING_COLOR = QColor("#b54708")
 
 
 class ImportDialog(QDialog):
-    """データファイルの取り込みダイアログ。
+    """データファイルの読み込み設定の確認ダイアログ。
 
     ``exec()`` が受理で終わったら、``import_path`` と ``import_request`` に選んだ内容が入る。
     部品はテストから操作できるよう公開属性にしている。
@@ -79,7 +90,13 @@ class ImportDialog(QDialog):
     """
 
     def __init__(
-        self, importer: DataImporter, path: Path | None = None, parent: QWidget | None = None
+        self,
+        importer: DataImporter,
+        path: Path | None = None,
+        parent: QWidget | None = None,
+        *,
+        suggestion: ImportSuggestion | None = None,
+        same_clock: bool = False,
     ) -> None:
         """部品を組み立て、ファイルが指定されていればプレビューを表示する。
 
@@ -87,15 +104,19 @@ class ImportDialog(QDialog):
             importer: 取り込み先のプロジェクトの取り込み処理（プレビューと登録先の候補に使う）。
             path: 取り込むファイル。
             parent: 親ウィジェット。
+            suggestion: 自動判定の結果（読み方の初期値と、確認が必要な理由に使う）。
+            same_clock: 他のファイルと同じ時計で記録したなら True（「同期済み」の初期値）。
         """
         super().__init__(parent)
-        self.setWindowTitle("データファイルの取り込み")
-        self.resize(980, 760)
+        self.setWindowTitle("読み込み設定の確認")
+        self.resize(900, 640)
         self._importer = importer
         self._path: Path | None = None
         self._preview: FilePreview | None = None
         self.import_path: Path | None = None
         self.import_request: ImportRequest | None = None
+        # 警告を表示して確認を求めた指定（同じ指定でもう一度押されたら取り込む）。
+        self._confirmed_request: ImportRequest | None = None
 
         # --- ファイルと読み込み条件 ---
         self.path_edit = QLineEdit()
@@ -160,6 +181,10 @@ class ImportDialog(QDialog):
         self.channel_table = QTableWidget(0, 4)
         self.channel_table.setHorizontalHeaderLabels(["取り込む", "列名", "種類", "単位（任意）"])
         self.channel_table.itemChanged.connect(self._update_ok_button)
+        # 単位の列まで横にスクロールせずに見えるようにする。
+        channel_header = self.channel_table.horizontalHeader()
+        channel_header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        channel_header.setStretchLastSection(True)
         channel_group = QGroupBox("チャンネル（数値の列のみ取り込めます）")
         channel_layout = QVBoxLayout(channel_group)
         channel_layout.addWidget(self.channel_table)
@@ -179,6 +204,7 @@ class ImportDialog(QDialog):
             "チェックしたファイルどうしは、同じ時間軸で縦に並べて比較できます。"
             "チェックしないファイルの時刻は、他のファイルと比較しません（勝手に揃えないため）。"
         )
+        self.shares_clock_check.setChecked(same_clock)
         self.experiment_combo.currentTextChanged.connect(self._on_experiment_changed)
         self.session_combo.currentTextChanged.connect(self._on_session_changed)
         target_form = QFormLayout()
@@ -192,7 +218,11 @@ class ImportDialog(QDialog):
 
         # --- 異常とボタン ---
         self.issues_list = QListWidget()
-        self.issues_list.setMaximumHeight(130)
+        self.issues_list.setMaximumHeight(110)
+        self.reason_label = QLabel()
+        self.reason_label.setWordWrap(True)
+        self.reason_label.setStyleSheet(f"color: {_WARNING_COLOR.name()}; font-weight: 600;")
+        self.reason_label.setVisible(False)
         self.button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -203,50 +233,58 @@ class ImportDialog(QDialog):
         self.button_box.accepted.connect(self.accept)
         self.button_box.rejected.connect(self.reject)
 
+        # 普段は触らなくてよい条件なので畳んでおく（読めないファイルでは読み方の欄を開く）。
+        self.read_section = CollapsibleSection("読み方（区切り文字・文字コードなど）", file_group)
+        self.target_section = CollapsibleSection("登録先の名前", target_group)
         middle = QHBoxLayout()
-        left = QVBoxLayout()
-        left.addWidget(time_group)
-        left.addWidget(target_group)
-        middle.addLayout(left, stretch=1)
+        middle.addWidget(time_group, stretch=1)
         middle.addWidget(channel_group, stretch=1)
         layout = QVBoxLayout(self)
-        layout.addWidget(file_group)
+        layout.addWidget(self.reason_label)
         layout.addWidget(preview_group, stretch=1)
         layout.addLayout(middle, stretch=1)
+        layout.addWidget(self.read_section)
+        layout.addWidget(self.target_section)
         layout.addWidget(self.issues_list)
         layout.addWidget(self.button_box)
 
         self._fill_experiment_names()
         if path is not None:
-            self.set_path(path)
+            self.set_path(path, suggestion)
         self._update_ok_button()
 
     # --- 公開操作 ------------------------------------------------------------
 
-    def set_path(self, path: Path) -> None:
+    def set_path(self, path: Path, suggestion: ImportSuggestion | None = None) -> None:
         """取り込むファイルを設定し、形式などの既定値を決めてプレビューを表示する。
 
         Args:
             path: 取り込むファイル。
+            suggestion: 自動判定の結果。なければ改めて判定する。
         """
         self._path = path
         self.path_edit.setText(str(path))
-        suffix = path.suffix.lower()
-        file_format = {".parquet": SourceFormat.PARQUET, ".tsv": SourceFormat.TSV}.get(
-            suffix, SourceFormat.CSV
+        decided = suggestion or self._importer.suggest(path)
+        self.format_combo.setCurrentIndex(self.format_combo.findData(file_format_of(path)))
+        options = decided.read_options
+        index = self.delimiter_combo.findData(options.delimiter)
+        self.delimiter_combo.setCurrentIndex(max(index, 0))
+        self.encoding_combo.setEditText(options.encoding)
+        self.skip_rows_spin.setValue(options.skip_rows)
+        self.reason_label.setText("\n".join(decided.review_reasons))
+        self.reason_label.setVisible(bool(decided.review_reasons))
+        experiment, session, _ = self._importer.default_target_names()
+        self.source_name_edit.setText(
+            self._importer.unique_source_name(path.stem, experiment, session)
         )
-        self.format_combo.setCurrentIndex(self.format_combo.findData(file_format))
-        delimiter = "\t" if file_format is SourceFormat.TSV else ","
-        self.delimiter_combo.setCurrentIndex(self.delimiter_combo.findData(delimiter))
-        self.source_name_edit.setText(path.stem)
-        if not self.trial_combo.currentText().strip():
-            self.trial_combo.setEditText(path.parent.name or "試技1")
         self.refresh_preview()
 
     def refresh_preview(self) -> None:
         """現在の読み込み条件でプレビューを読み直し、表示を更新する。"""
         self.issues_list.clear()
         self._preview = None
+        self._confirmed_request = None
+        self.button_box.button(QDialogButtonBox.StandardButton.Ok).setText("取り込む")
         if self._path is None:
             self._update_ok_button()
             return
@@ -262,6 +300,8 @@ class ImportDialog(QDialog):
         self._fill_time_columns(self._preview)
         for issue in self._preview.issues:
             self._add_issue(issue)
+        if any(issue.severity is IssueSeverity.ERROR for issue in self._preview.issues):
+            self.read_section.toggle_button.setChecked(True)
         self._update_ok_button()
 
     def build_request(self) -> ImportRequest:
@@ -294,13 +334,37 @@ class ImportDialog(QDialog):
         )
 
     def accept(self) -> None:
-        """取り込みの指定を検証し、問題がなければダイアログを閉じる（問題があれば閉じない）。"""
+        """取り込みの指定とファイルの内容を確認し、問題がなければダイアログを閉じる。
+
+        ファイル全体を指定どおりに検証する（何も書き込まない）。
+            - エラー（数値でない値など）があれば、一覧に表示して閉じない。
+            - 警告（NaN・時刻の飛びなど）だけなら、一度表示して確認を求め、同じ指定のまま
+              もう一度「取り込む」が押されたら閉じる（警告を見ずに取り込まないため）。
+        """
         if self._path is None:
             return
         try:
             request = self.build_request()
         except ValidationError as exc:
             self._show_validation_error(exc)
+            return
+        issues = self._importer.check(self._path, request)
+        has_error = any(issue.severity is IssueSeverity.ERROR for issue in issues)
+        # エラーは確認済みでも必ず止める（1 回目と 2 回目の間にファイルが変わった場合など）。
+        if has_error or (issues and request != self._confirmed_request):
+            self.issues_list.clear()
+            for issue in issues:
+                self._add_issue(issue)
+            if has_error:
+                self._confirmed_request = None
+                return
+            self._confirmed_request = request
+            self.issues_list.addItem(
+                QListWidgetItem("警告を確認したら、もう一度「取り込む」を押すと取り込みます")
+            )
+            self.button_box.button(QDialogButtonBox.StandardButton.Ok).setText(
+                "警告を確認して取り込む"
+            )
             return
         self.import_path = self._path
         self.import_request = request
@@ -339,11 +403,7 @@ class ImportDialog(QDialog):
         self.time_column_combo.addItem(NO_TIME_COLUMN_LABEL, None)
         for name in numeric:
             self.time_column_combo.addItem(name, name)
-        keywords = ("time", "時刻", "timestamp")
-        guess = next(
-            (name for name in numeric if any(word in name.lower() for word in keywords)),
-            numeric[0] if numeric else None,
-        )
+        guess = guess_time_column(preview)
         self.time_column_combo.setCurrentIndex(
             self.time_column_combo.findData(guess) if guess is not None else 0
         )
@@ -399,8 +459,10 @@ class ImportDialog(QDialog):
             for experiment in self._importer.store.database.list_entities(Experiment)
         ]
         self.experiment_combo.addItems(names)
-        if not names:
-            self.experiment_combo.setEditText("実験1")
+        experiment, session, trial = self._importer.default_target_names()
+        self.experiment_combo.setEditText(experiment)
+        self.session_combo.setEditText(session)
+        self.trial_combo.setEditText(trial)
         self._on_experiment_changed(self.experiment_combo.currentText())
 
     def _on_experiment_changed(self, name: str) -> None:
@@ -451,7 +513,7 @@ class ImportDialog(QDialog):
         self.absolute_check.setEnabled(has_time)
         self.interval_spin.setEnabled(not has_time)
         if isinstance(time_column, str):
-            unit = _guess_time_unit(time_column)
+            unit = parse_time_unit(time_column) or TimeUnit.SECOND
             self.time_unit_combo.setCurrentIndex(self.time_unit_combo.findData(unit))
         self._fill_channel_table()
 
@@ -473,6 +535,7 @@ class ImportDialog(QDialog):
         )
         ok_button = self.button_box.button(QDialogButtonBox.StandardButton.Ok)
         ok_button.setEnabled(not has_error and bool(self._checked_channels()))
+        self.issues_list.setVisible(self.issues_list.count() > 0)
 
     def _add_issue(self, issue: DataIssue) -> None:
         """異常を一覧に追加する（エラーは赤、警告は橙）。
@@ -563,26 +626,3 @@ class ImportDialog(QDialog):
             (列名, 単位) のリスト。
         """
         return [(name, unit) for name, _, unit in self._channel_rows(include_all=False)]
-
-
-def _guess_time_unit(column: str) -> TimeUnit:
-    """時刻列の名前から単位の既定値を推定する（"time_ms" ならミリ秒など）。
-
-    利用者が確認して変えられる既定値を決めるだけで、データには影響しない。
-
-    Args:
-        column: 時刻列の名前。
-
-    Returns:
-        推定した単位（分からなければ秒）。
-    """
-    name = column.lower().replace("[", "_").replace("]", "").replace("(", "_").replace(")", "")
-    for suffix, unit in (
-        ("ms", TimeUnit.MILLISECOND),
-        ("us", TimeUnit.MICROSECOND),
-        ("µs", TimeUnit.MICROSECOND),
-        ("ns", TimeUnit.NANOSECOND),
-    ):
-        if name.endswith(suffix):
-            return unit
-    return TimeUnit.SECOND

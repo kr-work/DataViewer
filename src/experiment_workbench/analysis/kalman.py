@@ -22,8 +22,11 @@
 使うモデルは ``StateSpaceSystem`` の実装で選ぶ:
     - ``LinearSystem``: 定数行列（等間隔の時刻が必要）
     - ``KinematicSystem``: 値とその時間微分を状態とする運動学モデル（不等間隔に対応）
+    - ``PolynomialObservationSystem``: 運動学モデル + 多項式の観測（EKF の組み込みモデル）
     - ``NonlinearSystem``: 任意の非線形関数とヤコビアン（EKF）。Python の関数で与えるため、
       条件をモデル（JSON）として保存することはできない（docs/DECISIONS.md 参照）。
+保存できる条件（KalmanSettings）からは ``system_from_settings()`` でモデルを作る。
+時間のかかる計算は、``run()`` の ``progress`` で進捗を受け取り、途中で中止できる。
 
 このモジュールは Qt に依存しない。
 """
@@ -37,6 +40,7 @@ import numpy as np
 
 from experiment_workbench.analysis.signal_processing import (
     DEFAULT_UNIFORM_TOLERANCE,
+    AnalysisCancelledError,
     AnalysisInputError,
     check_uniform_sampling,
     validate_time_axis,
@@ -45,11 +49,23 @@ from experiment_workbench.model import (
     AdaptiveNoiseMethod,
     AdaptiveNoiseParams,
     KalmanInitialState,
+    KalmanModelKind,
     KalmanResult,
+    KalmanSettings,
     KinematicSystemParams,
     LinearSystemParams,
+    PolynomialObservationParams,
 )
 from experiment_workbench.validation import FloatArray, check_covariance
+
+ProgressCallback = Callable[[float], bool]
+"""進捗（0〜1）を受け取り、続けるなら True、中止するなら False を返す関数。"""
+
+_PROGRESS_INTERVAL = 2000
+"""進捗の関数を呼ぶ間隔 [ステップ]。呼び出しの手間が計算時間に響かない程度に間引く。"""
+
+_MATRIX_CACHE_LIMIT = 256
+"""運動学モデルの F・Q を時間幅ごとに覚えておく数の上限（不等間隔のデータで増え続けないように）。"""
 
 TransitionFunction = Callable[[FloatArray, float], FloatArray]
 """状態遷移関数 f(x, Δt) → 予測状態 x⁻（長さ n の配列）。"""
@@ -216,7 +232,8 @@ class KinematicSystem(StateSpaceSystem):
     """値とその時間微分を状態とする運動学モデル（KinematicSystemParams）。
 
     状態は [値, 1 階微分, ..., d 階微分]（n = d + 1）、観測は値のみ（H = [1, 0, ..., 0]）。
-    F・Q を時間幅 Δt から毎回計算するため、不等間隔の時刻に対応する。
+    F・Q を時間幅 Δt から計算するため、不等間隔の時刻に対応する。等間隔のデータでは同じ Δt が
+    繰り返し現れるので、Δt ごとに F・Q を覚えておいて計算を省く（値は変わらない）。
 
     Attributes:
         params: モデルの条件。
@@ -232,6 +249,7 @@ class KinematicSystem(StateSpaceSystem):
         self._n_states = params.derivative_order + 1
         self._observation = np.zeros((1, self._n_states), dtype=np.float64)
         self._observation[0, 0] = 1.0
+        self._matrices = _KinematicMatrices(self._n_states, params.process_noise_density)
 
     @property
     def state_dim(self) -> int:
@@ -256,9 +274,9 @@ class KinematicSystem(StateSpaceSystem):
             dt: 予測する時間幅 Δt [s]。
 
         Returns:
-            (予測状態, F(Δt))。
+            (予測状態, F(Δt))。F は読み取り専用（覚えておいた行列を共有するため）。
         """
-        transition = kinematic_transition_matrix(self._n_states, dt)
+        transition = self._matrices.transition(dt)
         return transition @ state, transition
 
     def process_noise(self, dt: float) -> FloatArray:
@@ -268,9 +286,9 @@ class KinematicSystem(StateSpaceSystem):
             dt: 予測する時間幅 Δt [s]。
 
         Returns:
-            Q(Δt)。
+            Q(Δt)。読み取り専用（覚えておいた行列を共有するため）。
         """
-        return kinematic_process_noise(self._n_states, self.params.process_noise_density, dt)
+        return self._matrices.process_noise(dt)
 
     def measure(self, state: FloatArray) -> tuple[FloatArray, FloatArray]:
         """予測観測（状態の先頭要素 = 値）を返す。
@@ -290,6 +308,121 @@ class KinematicSystem(StateSpaceSystem):
             1×1 の R。
         """
         return np.array([[self.params.measurement_noise_std**2]], dtype=np.float64)
+
+
+class PolynomialObservationSystem(StateSpaceSystem):
+    """EKF の組み込みモデル: 運動学モデルの状態と、状態の先頭要素の多項式による観測。
+
+    状態は [x, x の 1 階微分, ...]（KinematicSystem と同じ遷移・プロセス雑音）、観測は::
+
+        h(x) = c0 + c1 x + c2 x² + ...,    H = [h'(x), 0, ..., 0]
+
+    観測が非線形なので、予測状態で評価したヤコビアン H で線形化する（EKF）。
+    h'(x) = 0 となる x の近くでは、観測から x の情報がほとんど得られない点に注意する。
+
+    Attributes:
+        params: モデルの条件。
+    """
+
+    def __init__(self, params: PolynomialObservationParams) -> None:
+        """モデルの条件を受け取って初期化する。
+
+        Args:
+            params: モデルの条件。
+        """
+        self.params = params
+        self._n_states = params.derivative_order + 1
+        self._coefficients = np.asarray(params.coefficients, dtype=np.float64)
+        self._derivative = np.polynomial.polynomial.polyder(self._coefficients)
+        self._matrices = _KinematicMatrices(self._n_states, params.process_noise_density)
+
+    @property
+    def state_dim(self) -> int:
+        """状態の次元 n（= 微分の最高階数 + 1）。"""
+        return self._n_states
+
+    @property
+    def measurement_dim(self) -> int:
+        """観測の次元（センサの出力 1 つなので 1）。"""
+        return 1
+
+    @property
+    def requires_uniform_sampling(self) -> bool:
+        """Δt ごとに F・Q を計算するため、等間隔は不要（False）。"""
+        return False
+
+    def predict(self, state: FloatArray, dt: float) -> tuple[FloatArray, FloatArray]:
+        """運動学モデルの状態遷移 x⁻ = F(Δt) x を計算する。
+
+        Args:
+            state: 現在の状態推定 x。
+            dt: 予測する時間幅 Δt [s]。
+
+        Returns:
+            (予測状態, F(Δt))。
+        """
+        transition = self._matrices.transition(dt)
+        return transition @ state, transition
+
+    def process_noise(self, dt: float) -> FloatArray:
+        """運動学モデルのプロセス雑音共分散 Q(Δt) を返す。
+
+        Args:
+            dt: 予測する時間幅 Δt [s]。
+
+        Returns:
+            Q(Δt)。
+        """
+        return self._matrices.process_noise(dt)
+
+    def measure(self, state: FloatArray) -> tuple[FloatArray, FloatArray]:
+        """多項式で予測観測を計算し、予測状態で評価したヤコビアンを返す。
+
+        Args:
+            state: 予測状態 x⁻。
+
+        Returns:
+            (予測観測 h(x)（長さ 1）, H（1×n）)。
+        """
+        value = float(state[0])
+        jacobian = np.zeros((1, self._n_states), dtype=np.float64)
+        jacobian[0, 0] = float(np.polynomial.polynomial.polyval(value, self._derivative))
+        predicted = np.array(
+            [float(np.polynomial.polynomial.polyval(value, self._coefficients))], dtype=np.float64
+        )
+        return predicted, jacobian
+
+    def measurement_noise(self) -> FloatArray:
+        """観測雑音共分散 R = σ² を返す。
+
+        Returns:
+            1×1 の R。
+        """
+        return np.array([[self.params.measurement_noise_std**2]], dtype=np.float64)
+
+
+def system_from_settings(settings: KalmanSettings) -> StateSpaceSystem:
+    """保存できる条件（KalmanSettings）から状態空間モデルを作る。
+
+    Args:
+        settings: カルマンフィルタの条件。
+
+    Returns:
+        状態空間モデル。
+
+    Raises:
+        AnalysisInputError: 選んだモデルの条件がない場合（モデルの検証で通常は起こらない）。
+    """
+    if settings.model_kind is KalmanModelKind.KINEMATIC and settings.kinematic is not None:
+        return KinematicSystem(settings.kinematic)
+    if settings.model_kind is KalmanModelKind.LINEAR and settings.linear is not None:
+        return LinearSystem(settings.linear)
+    if (
+        settings.model_kind is KalmanModelKind.POLYNOMIAL_OBSERVATION
+        and settings.polynomial_observation is not None
+    ):
+        return PolynomialObservationSystem(settings.polynomial_observation)
+    raise AnalysisInputError(f"モデル {settings.model_kind.value} の条件がありません")
 
 
 class NonlinearSystem(StateSpaceSystem):
@@ -470,6 +603,69 @@ def kinematic_process_noise(n_states: int, density: float, dt: float) -> FloatAr
     return noise
 
 
+class _KinematicMatrices:
+    """運動学モデルの F(Δt)・Q(Δt) を、時間幅 Δt ごとに覚えておく（モジュール内部用）。
+
+    等間隔のデータでは同じ Δt が繰り返し現れるため、毎回計算し直す手間を省く。
+    覚えておいた行列は共有するので、書き換えられないよう読み取り専用にする。
+    不等間隔のデータで Δt がすべて異なっても増え続けないよう、上限に達したら忘れる。
+    """
+
+    def __init__(self, n_states: int, density: float) -> None:
+        """状態の次元とプロセス雑音の強度を受け取る。
+
+        Args:
+            n_states: 状態の次元 n。
+            density: プロセス雑音のパワースペクトル密度 q。
+        """
+        self._n_states = n_states
+        self._density = density
+        self._cache: dict[float, tuple[FloatArray, FloatArray]] = {}
+
+    def transition(self, dt: float) -> FloatArray:
+        """F(Δt) を返す。
+
+        Args:
+            dt: 時間幅 Δt [s]。
+
+        Returns:
+            読み取り専用の F(Δt)。
+        """
+        return self._get(dt)[0]
+
+    def process_noise(self, dt: float) -> FloatArray:
+        """Q(Δt) を返す。
+
+        Args:
+            dt: 時間幅 Δt [s]。
+
+        Returns:
+            読み取り専用の Q(Δt)。
+        """
+        return self._get(dt)[1]
+
+    def _get(self, dt: float) -> tuple[FloatArray, FloatArray]:
+        """覚えておいた F・Q を返す（なければ計算して覚える）。
+
+        Args:
+            dt: 時間幅 Δt [s]。
+
+        Returns:
+            (F(Δt), Q(Δt))。
+        """
+        cached = self._cache.get(dt)
+        if cached is not None:
+            return cached
+        if len(self._cache) >= _MATRIX_CACHE_LIMIT:
+            self._cache.clear()
+        transition = kinematic_transition_matrix(self._n_states, dt)
+        noise = kinematic_process_noise(self._n_states, self._density, dt)
+        transition.setflags(write=False)
+        noise.setflags(write=False)
+        self._cache[dt] = (transition, noise)
+        return transition, noise
+
+
 # ---------------------------------------------------------------------------
 # カルマンフィルタ本体
 # ---------------------------------------------------------------------------
@@ -523,13 +719,17 @@ class KalmanFilter:
         self.adaptive = adaptive
         self.uniform_tolerance = uniform_tolerance
 
-    def run(self, t: FloatArray, z: FloatArray) -> KalmanResult:
+    def run(
+        self, t: FloatArray, z: FloatArray, progress: ProgressCallback | None = None
+    ) -> KalmanResult:
         """時系列の観測に対してフィルタを実行する。
 
         Args:
             t: 時刻 [s] の配列（狭義単調増加）。
             z: 観測の配列。観測が 1 次元なら (n,) または (n, 1)、m 次元なら (n, m)。
                 NaN を含む行は欠測として観測更新をしない。無限大は不可。
+            progress: 進捗（0〜1）を受け取り、続けるなら True を返す関数。
+                一定のステップごとに呼ぶ。False を返すと中止する。None なら呼ばない。
 
         Returns:
             時刻ごとの推定結果。
@@ -537,6 +737,7 @@ class KalmanFilter:
         Raises:
             AnalysisInputError: 時刻・観測が不正な場合、等間隔が必要なモデルで不等間隔の場合、
                 またはモデルの関数が不正な形の値を返した場合。
+            AnalysisCancelledError: ``progress`` が False を返して中止した場合。
         """
         times = validate_time_axis(t, min_samples=1)
         measurements = self._validate_measurements(z, times.size)
@@ -557,8 +758,12 @@ class KalmanFilter:
         covariance: FloatArray = np.asarray(self.initial.covariance, dtype=np.float64)
         noise = self.system.measurement_noise()
         estimator = None if self.adaptive is None else _AdaptiveNoiseEstimator(self.adaptive, noise)
+        # NaN を含む観測（欠測）の行は、ループの前にまとめて調べておく。
+        missing_rows = np.isnan(measurements).any(axis=1)
 
         for k in range(n):
+            if progress is not None and k % _PROGRESS_INTERVAL == 0 and not progress(k / n):
+                raise AnalysisCancelledError("カルマンフィルタの計算を中止しました")
             # --- 予測（先頭時刻は初期状態をそのまま事前推定とする） ---
             if k > 0:
                 dt = float(times[k] - times[k - 1])
@@ -567,15 +772,19 @@ class KalmanFilter:
 
             # --- 観測更新（NaN を含む観測は欠測として飛ばす） ---
             observed = measurements[k]
-            if not np.isnan(observed).any():
+            if not missing_rows[k]:
                 predicted_measurement, observation = self.system.measure(state)
                 innovation = observed - predicted_measurement
                 projected = observation @ covariance @ observation.T  # H P⁻ Hᵀ
                 if estimator is not None:
                     noise, noise_floor_applied[k] = estimator.estimate(innovation, projected)
                 innovation_covariance = projected + noise
-                # K = P⁻ Hᵀ S⁻¹ を、逆行列を作らずに S Kᵀ = H P⁻ を解いて求める（S, P⁻ は対称）。
-                gain = np.linalg.solve(innovation_covariance, observation @ covariance).T
+                # K = P⁻ Hᵀ S⁻¹。観測が 1 次元なら S はスカラーなので割り算で求める（速いため）。
+                # 多次元なら、逆行列を作らずに S Kᵀ = H P⁻ を解いて求める（S, P⁻ は対称）。
+                if nz == 1:
+                    gain = (observation @ covariance).T / innovation_covariance[0, 0]
+                else:
+                    gain = np.linalg.solve(innovation_covariance, observation @ covariance).T
                 state = state + gain @ innovation
                 correction = identity - gain @ observation
                 covariance = correction @ covariance @ correction.T + gain @ noise @ gain.T

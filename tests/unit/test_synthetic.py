@@ -17,6 +17,7 @@ from experiment_workbench.model import (
 from experiment_workbench.synthetic import (
     MANIFEST_FILE_NAME,
     SyntheticDataGenerator,
+    evaluate_io_output,
     evaluate_motion,
     main,
 )
@@ -370,3 +371,67 @@ def test_cli_refuses_non_empty_directory(tmp_path: Path) -> None:
     """空でない出力先には生成せず、終了コード 1 を返す。"""
     (tmp_path / "keep.txt").write_text("x", encoding="utf-8")
     assert main(["--output", str(tmp_path)]) == 1
+
+
+# --- 入出力の合成データ ----------------------------------------------------------
+
+
+def test_io_pair_matches_manifest(generated: Generated) -> None:
+    """io_pair.csv の列・行数・時刻の原点が目録と一致し、高レートファイルと同じ時計で記録される。"""
+    output, manifest = generated
+    for trial in manifest.trials:
+        record = trial.io_pair
+        frame = pl.read_csv(output / record.relpath)
+        assert frame.columns == list(record.column_units)
+        assert frame.height == record.n_rows
+        high = trial.sources[0]
+        assert record.clock_offset_s == high.clock_offset_s
+        assert record.recording_start_true_s == high.recording_start_true_s
+
+
+def test_io_output_follows_system_model(generated: Generated) -> None:
+    """真の出力は、遊び・むだ時間・一次遅れを 1 サンプルずつ計算した値と一致する。"""
+    output, manifest = generated
+    for trial in manifest.trials:
+        system = trial.io_system
+        rate = trial.io_pair.nominal_rate_hz
+        frame = pl.read_csv(output / trial.io_pair.relpath)
+        true_input = frame["true_input"].to_numpy().astype(np.float64)
+        half = system.play_width / 2
+        played = np.empty_like(true_input)
+        state = true_input[0] - half
+        for index, value in enumerate(true_input):
+            state = min(max(state, value - half), value + half)
+            played[index] = state
+        delay = round(system.delay_s * rate)
+        decay = np.exp(-1.0 / (rate * system.time_constant_s))
+        lagged = np.empty_like(played)
+        lagged[0] = played[0]
+        for index in range(1, played.size):
+            held = played[max(index - 1 - delay, 0)]
+            lagged[index] = decay * lagged[index - 1] + (1 - decay) * held
+        expected = system.offset + system.gain * lagged
+        # 入力・出力の小数 6 桁への丸めによる誤差を許容する。
+        np.testing.assert_allclose(frame["true_output"].to_numpy(), expected, atol=1e-5)
+        assert evaluate_io_output(system, true_input, rate) == pytest.approx(expected, abs=1e-5)
+
+
+def test_io_measured_values_follow_noise_model(generated: Generated) -> None:
+    """入力・出力の観測値と真値の差は、目録の雑音の標準偏差に従う。"""
+    output, manifest = generated
+    for trial in manifest.trials:
+        frame = pl.read_csv(output / trial.io_pair.relpath)
+        system = trial.io_system
+        input_noise = frame["input"].to_numpy() - frame["true_input"].to_numpy()
+        output_noise = frame["output"].to_numpy() - frame["true_output"].to_numpy()
+        assert input_noise.std() == pytest.approx(system.input_noise_std, rel=0.15)
+        assert output_noise.std() == pytest.approx(system.output_noise_std, rel=0.15)
+
+
+def test_io_steps_settle_before_next_step(generated: Generated) -> None:
+    """どの試技でも、ステップの間隔はむだ時間 + 時定数の 5 倍より長い（ステップ応答の前提）。"""
+    _, manifest = generated
+    for trial in manifest.trials:
+        system = trial.io_system
+        spacing = np.diff(system.step_times_s)
+        assert spacing.min() > system.delay_s + 5 * system.time_constant_s

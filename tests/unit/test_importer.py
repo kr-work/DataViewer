@@ -369,6 +369,36 @@ def test_data_errors_block_import_and_write_nothing(
     assert project.database.list_entities(Source) == []
 
 
+def test_check_returns_issues_without_writing_anything(
+    project: ProjectStore, synthetic_dataset: SyntheticDataset, tmp_path: Path
+) -> None:
+    """取り込み前の確認は、警告もエラーも例外にせずに返し、ファイルも DB も変更しない。"""
+    data, _ = synthetic_dataset
+    importer = DataImporter(project)
+    assert importer.check(data / "trial_001/high_rate.csv", high_rate_request()) == []
+    warnings = importer.check(data / "trial_002/high_rate.csv", high_rate_request("trial_002"))
+    assert [(issue.kind, issue.severity) for issue in warnings] == [
+        (DataIssueKind.MISSING_SEGMENT, IssueSeverity.WARNING)
+    ]
+    bad = _write(tmp_path / "bad.csv", "t,v\n0,1\n1,abc\n")
+    request = ImportRequest(
+        file_format=SourceFormat.CSV,
+        time_column="t",
+        channels=[ChannelImportSpec(column="v")],
+        experiment_name="e",
+        session_name="s",
+        trial_name="t",
+        source_name="bad",
+    )
+    errors = importer.check(bad, request)
+    assert (DataIssueKind.NON_NUMERIC_VALUES, IssueSeverity.ERROR) in [
+        (issue.kind, issue.severity) for issue in errors
+    ]
+    assert _files_under(project.directory(ProjectDirectory.ORIGINALS)) == []
+    assert _files_under(project.directory(ProjectDirectory.DATASETS)) == []
+    assert project.database.list_entities(Source) == []
+
+
 def test_resolve_targets_reuses_existing_entities(
     project: ProjectStore, synthetic_dataset: SyntheticDataset
 ) -> None:

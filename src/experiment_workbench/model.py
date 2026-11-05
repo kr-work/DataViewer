@@ -41,22 +41,30 @@ from pydantic import (
 
 from experiment_workbench import __version__
 from experiment_workbench.validation import (
+    COLOR_PATTERN,
     NON_BLANK_PATTERN,
     SHA256_PATTERN,
     VIEW_NAME_PATTERN,
     BoolArray,
     FloatArray,
+    check_alignment_settings,
     check_cutoff_frequencies,
     check_derivative_settings,
     check_encoding,
     check_import_columns,
     check_initial_state,
     check_kalman_result_arrays,
+    check_lag_range,
     check_linear_system,
     check_odd_window,
+    check_onset_threshold,
+    check_plot_series_arrays,
     check_polynomial_order,
+    check_selected_settings,
     check_series_arrays,
     check_time_column_consistency,
+    check_two_channel_settings,
+    check_xy_arrays,
     utc_now,
     validate_relative_posix_path,
     validate_tags,
@@ -73,7 +81,13 @@ PROJECT_FORMAT_VERSION = 1
 DATASET_TIME_COLUMN = "__time_s"
 
 # 表示設定（views/*.json）の保存形式バージョン。
-VIEW_FORMAT_VERSION = 1
+# v2（Phase 3）: パネルの channel_ids を series_ids に改名（解析の出力も置けるようにしたため）。
+VIEW_FORMAT_VERSION = 2
+
+# 保存した解析（pipelines/*.json）の保存形式バージョン。
+# v2（Phase 4）: 2 チャンネルの解析（output_channel_id・alignment・step_response・hysteresis・
+# cross_correlation）を追加。v1 のファイルは、追加した項目が None としてそのまま読める。
+ANALYSIS_FORMAT_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -606,18 +620,73 @@ class SyntheticSourceRecord(WorkbenchModel):
         return validate_relative_posix_path(value)
 
 
+class SyntheticIoSystem(WorkbenchModel):
+    """入出力の合成データ（io_pair.csv）を作った系の真値（入出力関係の解析の検証用）。
+
+    出力のモデル::
+
+        p(t) = play_h(u(t))                                   # 幅 h の遊び（バックラッシュ）
+        y(t) = offset + gain × LAG_τ[p](t - delay) + N(0, σ_y²)  # 一次遅れ（時定数 τ）とむだ時間
+
+    遊びは、入力が向きを変えると、入力が h だけ動くまで p を止める（最初は増加してきた状態）。
+    一次遅れは区間ごとに入力を一定とみなして厳密に離散化する（ステップには厳密、ランプには
+    半サンプル分の遅れが加わる）。入力の観測値は u + N(0, σ_u²)。
+
+    入力 u(t) の作り方（真の時刻）:
+        - 前半: ``step_times_s`` の各時刻に ``step_levels`` の値へ変わるステップ
+          （最初の値は ``initial_level``）。ステップの時刻はサンプルの時刻に合わせる。
+        - 後半: ``triangle_start_s`` から、``triangle_low`` と ``triangle_high`` の間を
+          周期 ``triangle_period_s`` で往復する三角波（low から上がり始める）。
+
+    Attributes:
+        gain: 遊びの後の倍率（出力の単位 / 入力の単位）。
+        offset: 出力のオフセット。
+        delay_s: むだ時間 [s]（サンプル間隔の整数倍）。
+        time_constant_s: 一次遅れの時定数 [s]。
+        play_width: 遊びの幅（入力の単位）。
+        input_noise_std: 入力の観測雑音の標準偏差。
+        output_noise_std: 出力の観測雑音の標準偏差。
+        initial_level: 入力の最初の値。
+        step_times_s: ステップの真の時刻 [s]。
+        step_levels: 各ステップの後の入力の値。
+        triangle_start_s: 三角波を始める真の時刻 [s]。
+        triangle_period_s: 三角波の周期 [s]。
+        triangle_low: 三角波の最小値。
+        triangle_high: 三角波の最大値。
+    """
+
+    gain: float
+    offset: float
+    delay_s: NonNegativeFloat
+    time_constant_s: PositiveFloat
+    play_width: NonNegativeFloat
+    input_noise_std: NonNegativeFloat
+    output_noise_std: NonNegativeFloat
+    initial_level: float
+    step_times_s: list[float]
+    step_levels: list[float]
+    triangle_start_s: float
+    triangle_period_s: PositiveFloat
+    triangle_low: float
+    triangle_high: float
+
+
 class SyntheticTrialRecord(WorkbenchModel):
     """合成した 1 試技の真値情報。
 
     Attributes:
         name: 試技名（ディレクトリ名と同じ）。
         motion: この試技の真の運動。
-        sources: この試技のファイル一覧。
+        sources: この試技の運動の観測ファイル（高レート・低レート）。
+        io_pair: 入出力の合成データのファイル（io_pair.csv）。
+        io_system: io_pair.csv を作った系の真値。
     """
 
     name: str
     motion: SyntheticMotion
     sources: list[SyntheticSourceRecord]
+    io_pair: SyntheticSourceRecord
+    io_system: SyntheticIoSystem
 
 
 class SyntheticBrokenFileRecord(WorkbenchModel):
@@ -1117,6 +1186,27 @@ class FilePreview(WorkbenchModel):
     issues: list[DataIssue]
 
 
+class ImportSuggestion(WorkbenchModel):
+    """ファイルの中身から自動で決めた取り込みの指定（ファイルを開くだけで始めるため）。
+
+    自信を持って決められないときは ``request`` を None にして、理由を ``review_reasons`` に入れる。
+    呼び出し側は取り込みダイアログで確認を求める（推測で取り込まない）。
+
+    Attributes:
+        file_format: 判定したファイル形式。
+        read_options: 判定した読み込み条件（確認を求めるときのダイアログの初期値にも使う）。
+        request: 取り込みの指定。確認が必要なら None。
+        review_reasons: 利用者の確認が必要な理由。
+        assumptions: 確認までは求めないが、利用者に知らせておく仮定（時刻の単位など）。
+    """
+
+    file_format: SourceFormat
+    read_options: ReadOptions = Field(default_factory=ReadOptions)
+    request: ImportRequest | None = None
+    review_reasons: list[str] = Field(default_factory=list)
+    assumptions: list[str] = Field(default_factory=list)
+
+
 class ImportTargets(WorkbenchModel):
     """取り込み先の実験・セッション・試技（名前から解決した結果）。
 
@@ -1184,11 +1274,11 @@ class PlotPanelState(WorkbenchModel):
     """縦並べ表示の 1 パネルの状態。
 
     Attributes:
-        channel_ids: パネルに表示するチャンネル（表示順）。
+        series_ids: パネルに表示する系列の ID（表示順）。チャンネル ID、または解析の出力の ID。
         y_range: 縦軸の範囲 (最小, 最大)。None なら自動調整。
     """
 
-    channel_ids: list[UUID] = Field(default_factory=list)
+    series_ids: list[UUID] = Field(default_factory=list)
     y_range: tuple[FiniteFloat, FiniteFloat] | None = None
 
 
@@ -1208,3 +1298,797 @@ class PlotView(WorkbenchModel):
     panels: list[PlotPanelState] = Field(default_factory=list)
     x_range: tuple[FiniteFloat, FiniteFloat] | None = None
     cursor_time_s: FiniteFloat | None = None
+
+
+# ---------------------------------------------------------------------------
+# 入出力関係の解析（SPEC A-09〜A-11・Phase 4）
+#
+# 入力（例: 張力）と出力（例: 電圧）の 2 チャンネルの関係を調べる解析の条件と結果。
+# 2 チャンネルは、時刻の対応（同じ時計、または明示した時刻オフセット）を確かめたうえで
+# 同じ時刻に対応付けて（AlignedPair）から解析する。
+# ---------------------------------------------------------------------------
+
+
+class InterpolationMethod(StrEnum):
+    """時刻の対応付け（A-11）で、サンプルのない時刻の値を求める補間の方法。"""
+
+    LINEAR = "linear"
+    """線形補間（numpy.interp）。前後のサンプルを直線で結ぶ。"""
+    PCHIP = "pchip"
+    """形状を保つ区分 3 次エルミート補間（scipy.interpolate.PchipInterpolator）。
+
+    滑らかで、元のデータにない行き過ぎ（オーバーシュート）を作らない。欠損（NaN）を含むデータには使えない。
+    """
+
+
+class AlignmentGrid(StrEnum):
+    """2 チャンネルを対応付ける時刻の並び。"""
+
+    INPUT = "input"
+    """入力チャンネルの時刻（出力チャンネルを補間する）。"""
+    OUTPUT = "output"
+    """出力チャンネルの時刻（入力チャンネルを補間する）。"""
+    UNIFORM = "uniform"
+    """指定した周波数の等間隔の時刻（両方を補間する）。相互相関など、等間隔が必要な解析用。"""
+
+
+class AlignmentParams(WorkbenchModel):
+    """入力・出力の 2 チャンネルを同じ時刻に対応付ける条件（A-11）。
+
+    時刻は入力チャンネルの時間軸で表す。出力チャンネルの時刻 t_out は次の式で入力の時間軸に移す::
+
+        t = t_out + output_time_offset_s
+
+    補間は 2 つのチャンネルの時刻が重なる範囲の中だけで行い（外挿しない）、時刻の間隔が
+    中央値の ``max_gap_factor`` 倍を超える区間（欠損）はまたがない（その時刻の値は NaN にする）。
+    2 つのチャンネルの時刻がまったく同じなら（同じ Source の列）、補間せずにそのまま対応付ける。
+
+    Attributes:
+        output_time_offset_s: 出力チャンネルの時刻に足す値 [s]。None なら、2 つのチャンネルの時刻が
+            そのまま比較できる（同じ Source、または同じ試技で同期済みとして取り込んだ Source）ことを
+            要求する。時計が違うチャンネルを対応付けるときは、ここに時刻の対応を明示する。
+        method: 補間の方法。
+        grid: 対応付ける時刻の並び。
+        uniform_rate_hz: ``grid`` が UNIFORM のときのサンプリング周波数 [Hz]。それ以外は None。
+        start_s: 解析する範囲の開始時刻（入力の時間軸）[s]。None なら重なりの先頭から。
+        end_s: 解析する範囲の終了時刻 [s]。None なら重なりの末尾まで。
+        max_gap_factor: 欠損とみなす時刻の間隔の、中央値に対する倍率（1 より大きい）。
+    """
+
+    output_time_offset_s: FiniteFloat | None = None
+    method: InterpolationMethod = InterpolationMethod.LINEAR
+    grid: AlignmentGrid = AlignmentGrid.INPUT
+    uniform_rate_hz: PositiveFloat | None = None
+    start_s: FiniteFloat | None = None
+    end_s: FiniteFloat | None = None
+    max_gap_factor: float = Field(default=1.5, gt=1.0)
+
+    @model_validator(mode="after")
+    def _check_grid_and_range(self) -> "AlignmentParams":
+        """等間隔の周波数の有無と、範囲の向きを確認する（validation に委ねる）。
+
+        Returns:
+            検証済みの自身。
+        """
+        check_alignment_settings(
+            uniform=self.grid is AlignmentGrid.UNIFORM,
+            uniform_rate_hz=self.uniform_rate_hz,
+            start_s=self.start_s,
+            end_s=self.end_s,
+        )
+        return self
+
+
+class AlignmentRecord(WorkbenchModel):
+    """2 チャンネルの対応付けで実際に行ったことの記録（結果と一緒に表示する）。
+
+    Attributes:
+        output_time_offset_s: 出力の時刻に足した値 [s]（時刻をそのまま比較できる場合は 0）。
+        offset_declared: 時刻オフセットを指定して対応付けたなら True。
+        shared_timestamps: 2 つのチャンネルの時刻が同じで、どちらも補間しなかったなら True。
+        input_interpolated: 入力チャンネルを補間したなら True。
+        output_interpolated: 出力チャンネルを補間したなら True。
+        method: 補間の方法。
+        start_s: 対応付けた範囲の開始時刻（入力の時間軸）[s]。
+        end_s: 対応付けた範囲の終了時刻 [s]。
+        n_samples: 対応付けた時刻の数。
+        n_gap_samples: 欠損区間に入ったため値を求めなかった（NaN にした）時刻の数。
+    """
+
+    output_time_offset_s: float
+    offset_declared: bool
+    shared_timestamps: bool
+    input_interpolated: bool
+    output_interpolated: bool
+    method: InterpolationMethod
+    start_s: float
+    end_s: float
+    n_samples: NonNegativeInt
+    n_gap_samples: NonNegativeInt
+
+
+class AlignedPair(WorkbenchModel):
+    """同じ時刻に対応付けた入力・出力の 2 チャンネル。
+
+    Attributes:
+        time_s: 時刻（入力の時間軸）[s]。
+        input_values: 入力チャンネルの値。
+        output_values: 出力チャンネルの値。
+        record: 対応付けの記録。
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    time_s: FloatArray
+    input_values: FloatArray
+    output_values: FloatArray
+    record: AlignmentRecord
+
+    @model_validator(mode="after")
+    def _check_arrays(self) -> "AlignedPair":
+        """時刻と 2 つの値の配列の dtype と形を確認する（validation に委ねる）。
+
+        Returns:
+            検証済みの自身。
+        """
+        check_series_arrays(self.time_s, self.input_values)
+        check_series_arrays(self.time_s, self.output_values)
+        return self
+
+
+class StepDirection(StrEnum):
+    """ステップ状の入力の変化の向き。"""
+
+    AUTO = "auto"
+    """範囲の先頭（初期値）と末尾（最終値）の大小から決める。"""
+    RISING = "rising"
+    """増加（立ち上がり）。"""
+    FALLING = "falling"
+    """減少（立ち下がり）。"""
+
+
+class OnsetThresholdMode(StrEnum):
+    """入力の変化の開始を判定するしきい値の決め方。"""
+
+    FRACTION = "fraction"
+    """入力の変化量（最終値 - 初期値）に対する割合。"""
+    ABSOLUTE = "absolute"
+    """入力の初期値からの変化の大きさ（入力の単位）。"""
+
+
+class StepResponseParams(WorkbenchModel):
+    """ステップ状の入力に対する出力の応答指標の条件（A-09）。
+
+    解析する範囲（AlignmentParams の start_s〜end_s）には、入力の変化が 1 回だけ入るようにする。
+    範囲の長さのうち、先頭の ``baseline_fraction`` を変化前の値（初期値）、末尾の
+    ``final_fraction`` を変化後の値（最終値）を平均で求める区間とする。入力の変化の開始は、
+    初期値の区間より後で、入力がしきい値を最初に越えた時刻とする（サンプルの間は線形補間）。
+    出力の変化の開始は、入力と同じ割合（入力のしきい値 ÷ 入力の変化量）で判定する。
+
+    Attributes:
+        direction: 入力の変化の向き。
+        onset_mode: 入力の変化の開始を判定するしきい値の決め方。
+        onset_threshold: しきい値。FRACTION なら 0〜1 の割合、ABSOLUTE なら入力の単位の大きさ。
+        baseline_fraction: 範囲の長さのうち、先頭から初期値を求める区間の割合（0〜0.5）。
+        final_fraction: 範囲の長さのうち、末尾から最終値を求める区間の割合（0〜0.5）。
+        settling_band: 整定とみなす最終値からのずれの幅（出力の変化量に対する割合）。
+        smoothing_cutoff_hz: 指標を求める前に入力と出力にかけるゼロ位相ローパスフィルタ
+            （4 次のバターワース）のカットオフ周波数 [Hz]。None なら平滑化しない。
+    """
+
+    direction: StepDirection = StepDirection.AUTO
+    onset_mode: OnsetThresholdMode = OnsetThresholdMode.FRACTION
+    onset_threshold: PositiveFloat = 0.1
+    baseline_fraction: float = Field(default=0.1, gt=0.0, lt=0.5)
+    final_fraction: float = Field(default=0.1, gt=0.0, lt=0.5)
+    settling_band: float = Field(default=0.05, gt=0.0, lt=1.0)
+    smoothing_cutoff_hz: PositiveFloat | None = None
+
+    @model_validator(mode="after")
+    def _check_threshold(self) -> "StepResponseParams":
+        """割合のしきい値が 1 未満であることを確認する（validation に委ねる）。
+
+        Returns:
+            検証済みの自身。
+        """
+        check_onset_threshold(
+            fraction_mode=self.onset_mode is OnsetThresholdMode.FRACTION,
+            threshold=self.onset_threshold,
+        )
+        return self
+
+
+class StepResponseResult(WorkbenchModel):
+    """ステップ応答の指標（A-09）。時間の指標は、入力の変化の開始からの時間 [s]。
+
+    出力を正規化した応答 r(t) = (y(t) - y0) / (y1 - y0)（初期値 y0 から最終値 y1 へ、
+    0 から 1 に向かう）について::
+
+        応答開始の遅れ    : r が入力と同じ割合のしきい値を最初に越えるまで
+        遅れ時間 Td       : r = 0.5 に達するまで
+        立ち上がり時間 Tr : r = 0.1 から 0.9 に達するまで
+        時定数 τ          : 1.5 × (t(0.632) - t(0.283))  （一次遅れ＋むだ時間で近似する 2 点法）
+        むだ時間 L        : t(0.632) - τ
+        整定時間 Ts       : |r - 1| <= settling_band を満たし続けるようになるまで
+        オーバーシュート  : max(r) - 1（負なら 0）
+
+    2 点法は、一次遅れ＋むだ時間の応答なら τ と L を厳密に与える（Smith の方法）。
+    求められなかった指標は None にし、理由を ``notes`` に書く。
+
+    Attributes:
+        direction: 判定した入力の変化の向き（RISING または FALLING）。
+        input_onset_s: 入力の変化の開始時刻（入力の時間軸）[s]。
+        input_initial: 入力の初期値。
+        input_final: 入力の最終値。
+        output_initial: 出力の初期値。
+        output_final: 出力の最終値。
+        gain: 出力の変化量 ÷ 入力の変化量。
+        response_delay_s: 応答開始の遅れ [s]。
+        delay_time_s: 遅れ時間 Td [s]。
+        rise_time_s: 立ち上がり時間 Tr [s]。
+        time_constant_s: 時定数 τ [s]。
+        dead_time_s: むだ時間 L [s]。
+        settling_time_s: 整定時間 Ts [s]。
+        overshoot: オーバーシュート（出力の変化量に対する割合）。
+        response_time_s: 各サンプルの、入力の変化の開始からの時間 [s]（表示用）。
+        normalized_input: 正規化した入力（表示用）。
+        normalized_output: 正規化した出力 r（表示用）。出力が変化していない場合は NaN。
+        notes: 求められなかった指標の理由などの注記。
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    direction: StepDirection
+    input_onset_s: float
+    input_initial: float
+    input_final: float
+    output_initial: float
+    output_final: float
+    gain: float
+    response_delay_s: float | None = None
+    delay_time_s: float | None = None
+    rise_time_s: float | None = None
+    time_constant_s: float | None = None
+    dead_time_s: float | None = None
+    settling_time_s: float | None = None
+    overshoot: float | None = None
+    response_time_s: FloatArray
+    normalized_input: FloatArray
+    normalized_output: FloatArray
+    notes: list[str] = Field(default_factory=list)
+
+
+class HysteresisParams(WorkbenchModel):
+    """入出力特性とヒステリシスの条件（A-10）。
+
+    入力の変化の速さ du/dt の符号で、各サンプルを「増加時」と「減少時」に分ける。
+    次の条件を満たす、向きが定まらないサンプル（折り返しや静止）は、どちらの分岐にも入れない::
+
+        |du/dt| < min_rate_fraction × (|du/dt| の 95 パーセンタイル)
+
+    基準に最大値ではなく 95 パーセンタイルを使うのは、雑音による一瞬の大きな値に左右されないため。
+    入力の範囲を ``n_bins`` 個の区間に分け、区間ごとに、増加時・減少時それぞれのサンプルに直線を
+    当てはめて、区間の中央の入力での出力の値（分岐の曲線）を求める（3 サンプル以上ある区間だけ）。
+    平均ではなく直線の当てはめを使うのは、2 つの分岐を同じ入力の値どうしで比べるため。
+
+    Attributes:
+        n_bins: 入力の範囲を分ける区間の数。
+        min_rate_fraction: 向きが定まらないとして分岐から除く、変化の速さの割合。
+        smoothing_cutoff_hz: 変化の向きの判定にだけ使う、入力のゼロ位相ローパスフィルタ
+            （4 次のバターワース）のカットオフ周波数 [Hz]。None なら平滑化しない。
+            X-Y の値と指標の計算には、平滑化しない値を使う。
+    """
+
+    n_bins: int = Field(default=50, ge=2, le=10_000)
+    min_rate_fraction: float = Field(default=0.05, ge=0.0, lt=1.0)
+    smoothing_cutoff_hz: PositiveFloat | None = None
+
+
+class HysteresisResult(WorkbenchModel):
+    """入出力特性とヒステリシスの指標（A-10）。
+
+    出力のフルスケール FS は、回帰直線の上で入力が最小値から最大値まで動いたときの出力の変化
+    |a| × (u_max - u_min) とする（a は回帰直線の傾き）::
+
+        直線性誤差   : 分岐の中央の曲線と回帰直線の差の最大値。中央の曲線は、区間ごとの増加時と
+                       減少時の分岐の値の中点（片方の分岐しかない区間は、全サンプルから求めた値）
+        ヒステリシス : 同じ入力の値での分岐の差 d = y_inc - y_dec。最大値は |d| の最大
+        ループ面積   : |Σ d Δu|（両方の分岐がある区間の和。分岐が囲む面積）
+
+    Attributes:
+        slope: 回帰直線の傾き（感度）。
+        intercept: 回帰直線の切片（オフセット）。
+        r_squared: 決定係数。出力がすべて同じ値なら None。
+        input_min: 入力の最小値。
+        input_max: 入力の最大値。
+        full_scale_output: FS。傾きが 0 なら None。
+        linearity_error: 直線性誤差（出力の単位）。求められなければ None。
+        linearity_ratio: 直線性誤差 ÷ FS。
+        max_hysteresis: 最大ヒステリシス（出力の単位）。両方の分岐がある区間がなければ None。
+        max_hysteresis_input: 最大ヒステリシスの区間の中央の入力の値。
+        hysteresis_ratio: 最大ヒステリシス ÷ FS。
+        mean_branch_difference: d の平均（正なら増加時の分岐が上にある）。
+        loop_area: ループ面積（入力の単位 × 出力の単位）。
+        n_increasing: 増加時のサンプル数。
+        n_decreasing: 減少時のサンプル数。
+        n_excluded: 向きが定まらず除いたサンプル数。
+        bin_centers: 区間の中央の入力の値（表示用）。
+        increasing_branch: 区間の中央の入力での、増加時の出力の値（サンプルが足りない区間は NaN）。
+        decreasing_branch: 区間の中央の入力での、減少時の出力の値（同上）。
+        increasing_mask: 各サンプルが増加時なら True（表示用）。
+        decreasing_mask: 各サンプルが減少時なら True（表示用）。
+        notes: 注記。
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    slope: float
+    intercept: float
+    r_squared: float | None
+    input_min: float
+    input_max: float
+    full_scale_output: float | None
+    linearity_error: float | None
+    linearity_ratio: float | None
+    max_hysteresis: float | None
+    max_hysteresis_input: float | None
+    hysteresis_ratio: float | None
+    mean_branch_difference: float | None
+    loop_area: float | None
+    n_increasing: NonNegativeInt
+    n_decreasing: NonNegativeInt
+    n_excluded: NonNegativeInt
+    bin_centers: FloatArray
+    increasing_branch: FloatArray
+    decreasing_branch: FloatArray
+    increasing_mask: BoolArray
+    decreasing_mask: BoolArray
+    notes: list[str] = Field(default_factory=list)
+
+
+class DetrendMode(StrEnum):
+    """相互相関を求める前に取り除く傾向（scipy.signal.detrend の type）。"""
+
+    CONSTANT = "constant"
+    """平均を引く。"""
+    LINEAR = "linear"
+    """最小二乗で当てはめた直線を引く（ゆっくりしたドリフトが相関を支配しないように）。"""
+
+
+class CrossCorrelationParams(WorkbenchModel):
+    """相互相関による遅れの推定の条件（A-09）。
+
+    出力が入力より遅れる向きを正とする（出力 y(t) ≈ 入力 x(t - τ) のとき遅れ τ > 0）。
+    遅れごとに、重なっている部分どうしの相関係数を求め、探索範囲の中で絶対値が最大になる遅れを
+    選ぶ。前後の 3 点に放物線を当てはめて、サンプル間隔より細かく求める。
+    重なりがサンプル数の半分未満になる遅れは、信頼できないので探さない。
+    等間隔の時刻が必要（AlignmentParams の grid を UNIFORM にするか、等間隔のチャンネルを使う）。
+
+    Attributes:
+        min_lag_s: 遅れを探す範囲の下限 [s]（負にすると、出力が先行する場合も探す）。
+        max_lag_s: 遅れを探す範囲の上限 [s]。
+        detrend: 相関を求める前に取り除く傾向。
+        use_derivative: True なら、値の代わりに変化の速さ（時間微分）の相関を取る。
+            ステップ状の信号では、値の相関のピークはなだらかだが、変化の速さの相関のピークは鋭くなる。
+    """
+
+    min_lag_s: FiniteFloat
+    max_lag_s: FiniteFloat
+    detrend: DetrendMode = DetrendMode.CONSTANT
+    use_derivative: bool = False
+
+    @model_validator(mode="after")
+    def _check_lags(self) -> "CrossCorrelationParams":
+        """探索範囲の下限が上限より小さいことを確認する（validation に委ねる）。
+
+        Returns:
+            検証済みの自身。
+        """
+        check_lag_range(self.min_lag_s, self.max_lag_s)
+        return self
+
+
+class CrossCorrelationResult(WorkbenchModel):
+    """相互相関による遅れの推定結果（A-09）。
+
+    Attributes:
+        delay_s: 推定した遅れ [s]（正なら出力が遅れる）。
+        peak_coefficient: その遅れでの相関係数（-1〜1。負なら出力は入力と逆向きに変化する）。
+        sample_interval_s: サンプル間隔 [s]（遅れの細かさの目安）。
+        at_search_edge: 相関の絶対値が最大になったのが探索範囲の端なら True
+            （真の遅れは探索範囲の外にあるかもしれない）。
+        lags_s: 探した遅れ [s]（表示用）。
+        coefficients: 遅れごとの相関係数（表示用）。
+        notes: 注記。
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    delay_s: float
+    peak_coefficient: float
+    sample_interval_s: PositiveFloat
+    at_search_edge: bool
+    lags_s: FloatArray
+    coefficients: FloatArray
+    notes: list[str] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# 保存できる解析と、その表示（SPEC F-11・Phase 3）
+# ---------------------------------------------------------------------------
+
+
+class PolynomialObservationParams(WorkbenchModel):
+    """EKF の組み込みモデル「運動学モデル + 多項式の観測」の条件。
+
+    状態は運動学モデル（KinematicSystemParams と同じ。状態 x とその時間微分）で、
+    観測は状態の先頭要素 x の多項式とする::
+
+        z = c0 + c1 x + c2 x² + ... + v,   v ~ N(0, σ²)
+
+    センサの出力（例: 電圧）が、物理量（例: 張力）の非線形な関数として分かっている場合に、
+    物理量とその変化率を推定するのに使う。観測が非線形なので EKF になる。
+
+    Attributes:
+        derivative_order: 状態に含める x の微分の最高階数（1 または 2）。
+        process_noise_density: x の最高階の微分を駆動する白色雑音のパワースペクトル密度 q。
+        measurement_noise_std: 観測（センサの出力）の雑音の標準偏差。
+        coefficients: 多項式の係数 [c0, c1, c2, ...]（昇べきの順、2 つ以上）。
+    """
+
+    derivative_order: int = Field(default=1, ge=1, le=2)
+    process_noise_density: PositiveFloat
+    measurement_noise_std: PositiveFloat
+    coefficients: list[FiniteFloat] = Field(min_length=2)
+
+
+class KalmanModelKind(StrEnum):
+    """GUI などから選べるカルマンフィルタの状態空間モデル（値は KalmanSettings の項目名と同じ）。"""
+
+    KINEMATIC = "kinematic"
+    """運動学モデル（値とその時間微分。線形 KF）。"""
+    LINEAR = "linear"
+    """定数行列の線形モデル（線形 KF）。"""
+    POLYNOMIAL_OBSERVATION = "polynomial_observation"
+    """運動学モデル + 多項式の観測（EKF の組み込みモデル）。"""
+
+
+class KalmanSettings(WorkbenchModel):
+    """保存できるカルマンフィルタの条件（モデル・初期状態・適応推定）。
+
+    ``model_kind`` で選んだモデルの条件だけを指定する（使わない条件は None）。
+
+    Attributes:
+        model_kind: 状態空間モデルの種類。
+        kinematic: 運動学モデルの条件。
+        linear: 線形モデルの条件。
+        polynomial_observation: EKF の組み込みモデルの条件。
+        initial: 初期状態（モデルの状態の次元と合っていること。実行時に確認する）。
+        adaptive: 適応推定（観測雑音 R の逐次推定）の条件。None なら R は一定。
+    """
+
+    model_kind: KalmanModelKind
+    kinematic: KinematicSystemParams | None = None
+    linear: LinearSystemParams | None = None
+    polynomial_observation: PolynomialObservationParams | None = None
+    initial: KalmanInitialState
+    adaptive: AdaptiveNoiseParams | None = None
+
+    @model_validator(mode="after")
+    def _check_model(self) -> "KalmanSettings":
+        """選んだモデルの条件だけが指定されているかを確認する（validation に委ねる）。
+
+        Returns:
+            検証済みの自身。
+        """
+        provided = {
+            KalmanModelKind.KINEMATIC: self.kinematic,
+            KalmanModelKind.LINEAR: self.linear,
+            KalmanModelKind.POLYNOMIAL_OBSERVATION: self.polynomial_observation,
+        }
+        check_selected_settings(
+            selected=self.model_kind.value,
+            provided=[kind.value for kind, value in provided.items() if value is not None],
+        )
+        return self
+
+
+class AnalysisKind(StrEnum):
+    """保存できる解析の種類（値は AnalysisSpec の項目名と同じ）。"""
+
+    BUTTERWORTH = "butterworth"
+    MOVING_AVERAGE = "moving_average"
+    SAVITZKY_GOLAY = "savitzky_golay"
+    DERIVATIVE = "derivative"
+    INTEGRAL = "integral"
+    KALMAN = "kalman"
+    STEP_RESPONSE = "step_response"
+    """ステップ応答の指標（入力と出力の 2 チャンネル。Phase 4）。"""
+    HYSTERESIS = "hysteresis"
+    """入出力特性とヒステリシス（2 チャンネル。Phase 4）。"""
+    CROSS_CORRELATION = "cross_correlation"
+    """相互相関による遅れの推定（2 チャンネル。Phase 4）。"""
+
+
+TWO_CHANNEL_ANALYSIS_KINDS = frozenset(
+    {AnalysisKind.STEP_RESPONSE, AnalysisKind.HYSTERESIS, AnalysisKind.CROSS_CORRELATION}
+)
+"""入力と出力の 2 チャンネルを使う解析の種類（output_channel_id と alignment が要る）。"""
+
+
+class AnalysisSpec(Entity):
+    """保存できる 1 段の解析。
+
+    1 つの入力チャンネルに 1 つの処理をかける解析（フィルタ・カルマンフィルタなど）と、
+    入力と出力の 2 チャンネルの関係を調べる解析（ステップ応答・ヒステリシス・相互相関。
+    TWO_CHANNEL_ANALYSIS_KINDS）がある。後者だけが ``output_channel_id`` と ``alignment`` を持つ。
+    pipelines/<ID>.json に保存し、同じ条件でいつでも再計算できるようにする。
+    ``kind`` で選んだ種類の条件だけを指定する（使わない条件は None）。
+    複数段の処理（パイプライン）と複数試技への一括適用は v0.2 で扱う。
+
+    Attributes:
+        format_version: 保存形式のバージョン。
+        name: 解析の名前（表示用）。
+        input_channel_id: 入力チャンネルの ID。
+        kind: 解析の種類。
+        output_channel_id: 2 チャンネルの解析の出力チャンネルの ID（それ以外は None）。
+        alignment: 2 チャンネルを同じ時刻に対応付ける条件（2 チャンネルの解析だけ）。
+        butterworth: バターワースフィルタの条件。
+        moving_average: 移動平均の条件。
+        savitzky_golay: Savitzky-Golay 平滑化の条件。
+        derivative: 微分の条件。
+        integral: 積分の条件。
+        kalman: カルマンフィルタ系の条件。
+        step_response: ステップ応答の条件。
+        hysteresis: 入出力特性とヒステリシスの条件。
+        cross_correlation: 相互相関の条件。
+    """
+
+    format_version: PositiveInt = ANALYSIS_FORMAT_VERSION
+    name: str = Field(pattern=NON_BLANK_PATTERN)
+    input_channel_id: UUID
+    kind: AnalysisKind
+    output_channel_id: UUID | None = None
+    alignment: AlignmentParams | None = None
+    butterworth: ButterworthParams | None = None
+    moving_average: MovingAverageParams | None = None
+    savitzky_golay: SavitzkyGolayParams | None = None
+    derivative: DerivativeParams | None = None
+    integral: IntegralParams | None = None
+    kalman: KalmanSettings | None = None
+    step_response: StepResponseParams | None = None
+    hysteresis: HysteresisParams | None = None
+    cross_correlation: CrossCorrelationParams | None = None
+
+    @model_validator(mode="after")
+    def _check_params(self) -> "AnalysisSpec":
+        """選んだ種類の条件だけが指定され、2 チャンネルの指定が種類と合うかを確認する。
+
+        Returns:
+            検証済みの自身。
+        """
+        provided = {
+            AnalysisKind.BUTTERWORTH: self.butterworth,
+            AnalysisKind.MOVING_AVERAGE: self.moving_average,
+            AnalysisKind.SAVITZKY_GOLAY: self.savitzky_golay,
+            AnalysisKind.DERIVATIVE: self.derivative,
+            AnalysisKind.INTEGRAL: self.integral,
+            AnalysisKind.KALMAN: self.kalman,
+            AnalysisKind.STEP_RESPONSE: self.step_response,
+            AnalysisKind.HYSTERESIS: self.hysteresis,
+            AnalysisKind.CROSS_CORRELATION: self.cross_correlation,
+        }
+        check_selected_settings(
+            selected=self.kind.value,
+            provided=[kind.value for kind, value in provided.items() if value is not None],
+        )
+        check_two_channel_settings(
+            two_channel=self.kind in TWO_CHANNEL_ANALYSIS_KINDS,
+            has_output_channel=self.output_channel_id is not None,
+            has_alignment=self.alignment is not None,
+            same_channel=self.output_channel_id == self.input_channel_id,
+        )
+        return self
+
+
+class AnalysisOutputInfo(WorkbenchModel):
+    """解析の出力 1 つの情報（計算しなくても分かる、ID・名前・単位）。
+
+    Attributes:
+        series_id: 出力の ID（解析の ID と ``key`` から決まり、再計算しても変わらない）。
+        key: 解析の中での出力の名前（例: "output"、"state_0"、"innovation"）。
+        label: 表示名。
+        unit: 単位。分からなければ None。
+    """
+
+    series_id: UUID
+    key: str
+    label: str
+    unit: str | None = None
+
+
+class PlotSeries(WorkbenchModel):
+    """縦並べ表示に置く 1 系列（生データのチャンネル、または解析の出力）。
+
+    Attributes:
+        series_id: 系列の ID（チャンネル ID、または解析の出力の ID）。
+        label: 凡例やカーソル表示に使う名前。
+        channel_name: チャンネル名（解析の出力は入力チャンネルの名前）。図の見出しと、
+            凡例の短い名前（"元データ"、"LPF 10 Hz" など）を作るのに使う。
+        unit: 単位。分からなければ None。
+        source: 時間軸を決める Source（解析の出力は入力チャンネルの Source）。
+        time_s: 時刻 [s]。
+        values: 値。欠損は NaN。
+        band_lower: 帯の下端（カルマンフィルタの推定値 - σ など）。帯がなければ None。
+        band_upper: 帯の上端。``band_lower`` と組で指定する。
+        marker_times_s: 印を付ける時刻（観測更新しなかった時刻など）。なければ None。
+        analysis_id: 解析の出力なら解析の ID。生データなら None。
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    series_id: UUID
+    label: str
+    channel_name: str = ""
+    unit: str | None = None
+    source: Source
+    time_s: FloatArray
+    values: FloatArray
+    band_lower: FloatArray | None = None
+    band_upper: FloatArray | None = None
+    marker_times_s: FloatArray | None = None
+    analysis_id: UUID | None = None
+
+    @model_validator(mode="after")
+    def _check_arrays(self) -> "PlotSeries":
+        """配列の dtype・形の整合を確認する（validation に委ねる）。
+
+        Returns:
+            検証済みの自身。
+        """
+        check_plot_series_arrays(
+            self.time_s, self.values, self.band_lower, self.band_upper, self.marker_times_s
+        )
+        return self
+
+
+class AnalysisMetric(WorkbenchModel):
+    """解析の結果の指標 1 つ（解析結果の表に表示する）。
+
+    Attributes:
+        key: 指標の識別名（例: "delay_time_s"）。テストや出力で指標を探すのに使う。
+        label: 表示名。
+        value: 値。求められなかった場合は None。
+        unit: 単位。単位がない、または分からない場合は None。
+        note: 指標の定義や、求められなかった理由。
+    """
+
+    key: str
+    label: str
+    value: FiniteFloat | None = None
+    unit: str | None = None
+    note: str = ""
+
+
+class ChartStyle(StrEnum):
+    """解析結果のグラフで、系列をどう描くか。"""
+
+    LINE = "line"
+    """実線。"""
+    DASHED = "dashed"
+    """破線（回帰直線や基準の線）。"""
+    POINTS = "points"
+    """小さな点（散布図）。"""
+    MARKERS = "markers"
+    """目立つ印（ピークなど、少数の点）。"""
+
+
+class ChartSeries(WorkbenchModel):
+    """解析結果のグラフの 1 系列（X と Y の組）。
+
+    Attributes:
+        label: 凡例に出す名前。
+        x: X 座標（float64 の 1 次元配列）。
+        y: Y 座標（x と同じ長さ）。
+        style: 描き方。
+        color: 色（"#rrggbb"）。None なら表示側が順番に割り当てる。
+            増加時・減少時の分岐のように、意味で色を決めたいときに指定する。
+        show_in_legend: 凡例に出すなら True。基準線や背景の点は出さない
+            （凡例の項目が多いと、読み取ってほしい線が分からなくなるため）。
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    label: str
+    x: FloatArray
+    y: FloatArray
+    style: ChartStyle = ChartStyle.LINE
+    color: str | None = Field(default=None, pattern=COLOR_PATTERN)
+    show_in_legend: bool = True
+
+    @model_validator(mode="after")
+    def _check_arrays(self) -> "ChartSeries":
+        """X と Y の配列の dtype と形を確認する（validation に委ねる）。
+
+        Returns:
+            検証済みの自身。
+        """
+        check_xy_arrays(self.x, self.y)
+        return self
+
+
+class ChartAnnotation(WorkbenchModel):
+    """解析結果のグラフに直接書き込む注記（X の位置の縦線と文字）。
+
+    凡例と別の表を見比べなくても、図の上で「どこが何か」が分かるようにするため。
+
+    Attributes:
+        x: 縦線の X 座標。
+        text: 添える文字。
+    """
+
+    x: FiniteFloat
+    text: str
+
+
+class AnalysisChart(WorkbenchModel):
+    """解析結果のグラフ 1 つ（X-Y 表示や相関の曲線。時系列の縦並べとは別に表示する）。
+
+    Attributes:
+        title: グラフの題名（何の図かが分かる、普通の言葉で書く）。
+        x_label: X 軸の名前（単位を含む）。
+        y_label: Y 軸の名前（単位を含む）。
+        series: 系列。
+        annotations: 図に書き込む注記。
+        log_x: X 軸を対数にするなら True（周波数解析で使う）。
+        log_y: Y 軸を対数にするなら True。
+    """
+
+    title: str
+    x_label: str
+    y_label: str
+    series: list[ChartSeries]
+    annotations: list[ChartAnnotation] = Field(default_factory=list)
+    log_x: bool = False
+    log_y: bool = False
+
+
+class TimeMarker(WorkbenchModel):
+    """縦並べ表示に引く時刻の印（ステップ応答の、入力の変化の開始など）。
+
+    Attributes:
+        time_s: 時刻（解析の入力チャンネルの時間軸）[s]。
+        label: 印に添える名前。
+    """
+
+    time_s: FiniteFloat
+    label: str
+
+
+class AnalysisResult(WorkbenchModel):
+    """解析を実行した結果（表示用の系列・指標・グラフ・時刻の印と、結果の要約）。
+
+    1 チャンネルの処理（フィルタ・カルマンフィルタなど）は ``series`` に時系列を返す。
+    2 チャンネルの解析（ステップ応答など）は時系列を返さず、``metrics``・``charts``・
+    ``time_markers`` を返す。
+
+    Attributes:
+        analysis_id: 解析の ID。
+        series: 出力の系列（AnalysisOutputInfo と同じ順）。
+        headline: 結果を数値入りの一文で述べたもの（図を見て何が起きたかが分かるように）。
+        summary: 結果の補足。読み手に必ず見せる内容（推定した R の最終値、補間や時刻オフセット
+            など結果に関わる変換、注意点）。
+        conditions: 計算の条件の記録（解析した範囲、サンプル数など）。普段は畳んで表示する。
+        metrics: 指標（解析結果の表に表示する）。
+        charts: グラフ（X-Y 表示など）。
+        time_markers: 縦並べ表示に引く時刻の印（入力チャンネルの時間軸）。
+    """
+
+    analysis_id: UUID
+    series: list[PlotSeries]
+    headline: str = ""
+    summary: list[str] = Field(default_factory=list)
+    conditions: list[str] = Field(default_factory=list)
+    metrics: list[AnalysisMetric] = Field(default_factory=list)
+    charts: list[AnalysisChart] = Field(default_factory=list)
+    time_markers: list[TimeMarker] = Field(default_factory=list)

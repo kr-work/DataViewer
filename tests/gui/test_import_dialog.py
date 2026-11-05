@@ -1,9 +1,9 @@
-"""ui/import_dialog.py（取り込みダイアログ）のテスト。"""
+"""ui/import_dialog.py（読み込み設定の確認ダイアログ）のテスト。"""
 
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QDialogButtonBox
+from PySide6.QtWidgets import QDialog, QDialogButtonBox
 from pytestqt.qtbot import QtBot
 
 from experiment_workbench.importer import DataImporter
@@ -119,18 +119,44 @@ def test_file_with_structural_error_cannot_be_imported(
     assert not _ok_enabled(dialog)
 
 
-def test_changing_encoding_fixes_shift_jis_file(
+def test_shift_jis_file_is_detected_and_encoding_can_be_changed(
     qtbot: QtBot, project: ProjectStore, synthetic_dataset: SyntheticDataset
 ) -> None:
-    """Shift_JIS のファイルは、文字コードを cp932 にしてプレビューを更新すると読める。"""
+    """Shift_JIS のファイルは自動で読め、文字コードを変えるとプレビューが読み直される。"""
     data, _ = synthetic_dataset
     dialog = _dialog(qtbot, project, data / "broken/shift_jis_header.csv")
-    assert not _ok_enabled(dialog)
-    dialog.encoding_combo.setEditText("cp932")
-    dialog.refresh_preview()
-    assert _issue_texts(dialog) == []
+    assert dialog.encoding_combo.currentText() == "cp932"
     assert dialog.time_column_combo.currentData() == "時刻[s]"
     assert _ok_enabled(dialog)
+    dialog.encoding_combo.setEditText("utf-8")
+    dialog.refresh_preview()
+    assert not _ok_enabled(dialog)
+    assert any(text.startswith("エラー") for text in _issue_texts(dialog))
+
+
+def test_detail_sections_are_collapsed_unless_unreadable(
+    qtbot: QtBot, project: ProjectStore, synthetic_dataset: SyntheticDataset
+) -> None:
+    """読み方と登録先は普段は畳み、読めないファイルでは読み方の欄を開いて理由も見せる。"""
+    data, _ = synthetic_dataset
+    readable = _dialog(qtbot, project, data / "trial_001/high_rate.csv")
+    assert not readable.read_section.body.isVisibleTo(readable)
+    assert not readable.target_section.body.isVisibleTo(readable)
+    assert not readable.issues_list.isVisibleTo(readable)
+    broken = _dialog(qtbot, project, data / "broken/duplicate_columns.csv")
+    assert broken.read_section.body.isVisibleTo(broken)
+    assert "value" in broken.reason_label.text()
+    assert broken.reason_label.isVisibleTo(broken)
+
+
+def test_same_clock_is_passed_in(
+    qtbot: QtBot, project: ProjectStore, synthetic_dataset: SyntheticDataset
+) -> None:
+    """時計の答えが、同期済みの指定の初期値になる。"""
+    data, _ = synthetic_dataset
+    dialog = ImportDialog(DataImporter(project), data / "trial_001/high_rate.csv", same_clock=True)
+    qtbot.addWidget(dialog)
+    assert dialog.build_request().shares_trial_clock
 
 
 def test_build_request_reflects_choices(
@@ -190,3 +216,62 @@ def test_accept_with_invalid_name_keeps_dialog_open(
     dialog.accept()
     assert dialog.import_request is None
     assert any(text.startswith("エラー") for text in _issue_texts(dialog))
+
+
+def _ok_text(dialog: ImportDialog) -> str:
+    """「取り込む」ボタンの表示を返す。
+
+    Args:
+        dialog: 取り込みダイアログ。
+
+    Returns:
+        ボタンの文字列。
+    """
+    return dialog.button_box.button(QDialogButtonBox.StandardButton.Ok).text()
+
+
+def test_warnings_need_second_press_to_import(
+    qtbot: QtBot, project: ProjectStore, synthetic_dataset: SyntheticDataset
+) -> None:
+    """警告（欠損区間）のあるファイルは、1 回目で警告を見せて閉じず、2 回目で取り込む。"""
+    data, _ = synthetic_dataset
+    dialog = _dialog(qtbot, project, data / "trial_002/high_rate.csv")
+    dialog.accept()
+    assert dialog.import_request is None
+    assert any(text.startswith("警告") for text in _issue_texts(dialog))
+    assert _ok_text(dialog) == "警告を確認して取り込む"
+    dialog.accept()
+    assert dialog.import_request is not None
+    assert dialog.result() == QDialog.DialogCode.Accepted
+
+
+def test_changed_settings_after_warning_need_new_confirmation(
+    qtbot: QtBot, project: ProjectStore, synthetic_dataset: SyntheticDataset
+) -> None:
+    """警告を見た後に指定を変えたら、変えた指定でもう一度確認を求める。"""
+    data, _ = synthetic_dataset
+    dialog = _dialog(qtbot, project, data / "trial_002/high_rate.csv")
+    dialog.accept()
+    dialog.source_name_edit.setText("renamed")
+    dialog.accept()
+    assert dialog.import_request is None
+    dialog.accept()
+    assert dialog.import_request is not None
+    assert dialog.import_request.source_name == "renamed"
+
+
+def test_data_error_after_preview_rows_keeps_dialog_open(
+    qtbot: QtBot, project: ProjectStore, tmp_path: Path
+) -> None:
+    """プレビューに出ない行の数値でない値も、取り込む前の確認でエラーとして表示し、閉じない。"""
+    rows = [f"{index * 0.1:.1f},{index}" for index in range(30)]
+    rows[25] = "2.5,abc"
+    path = tmp_path / "late_error.csv"
+    path.write_text("time_s,value\n" + "\n".join(rows) + "\n", encoding="utf-8")
+    dialog = _dialog(qtbot, project, path)
+    assert _ok_enabled(dialog)  # 先頭 20 行のプレビューでは異常が分からない
+    for _ in range(2):  # 何度押しても、エラーがある限り取り込まない
+        dialog.accept()
+        assert dialog.import_request is None
+    assert any(text.startswith("エラー") and "value" in text for text in _issue_texts(dialog))
+    assert _ok_text(dialog) == "取り込む"

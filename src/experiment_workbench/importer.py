@@ -12,6 +12,10 @@
        失敗したら 3 で書いたファイルを消す。
     ``import_file()`` は 1 を除く 2〜4 を同期的にまとめて実行する（スクリプト・テスト用）。
 
+ファイルを開くだけで始められるよう、``suggest()`` がファイルの中身から指定を自動で決める。
+判定するのは読み方（形式・文字コード・区切り文字・前置きの行数・時刻列・単位）だけで、データは
+変えない。自信を持って決められないときは推測で取り込まず、利用者に確認を求める。
+
 異常の扱い（SPEC 原則 6「隠して修正しない」）:
     - エラー（取り込みを中止する）: 空のファイル、ヘッダーのみ、列名の重複、文字コードの誤り、
       指定した列がない、数値として読めない値、時刻列の欠損。
@@ -29,6 +33,8 @@ import codecs
 import csv
 import hashlib
 import io
+import re
+from collections import Counter
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -39,12 +45,14 @@ from pydantic import ValidationError
 from experiment_workbench.model import (
     DATASET_TIME_COLUMN,
     Channel,
+    ChannelImportSpec,
     ColumnPreview,
     DataIssue,
     DataIssueKind,
     Experiment,
     FilePreview,
     ImportRequest,
+    ImportSuggestion,
     ImportTargets,
     IssueSeverity,
     PreparedImport,
@@ -55,6 +63,7 @@ from experiment_workbench.model import (
     SourceFormat,
     TimeAxisKind,
     TimeBase,
+    TimeUnit,
     Trial,
 )
 from experiment_workbench.storage import ProjectDirectory, ProjectStore, StorageError
@@ -70,7 +79,40 @@ MISSING_SEGMENT_FACTOR = 1.5
 1 サンプル欠ければ間隔は 2 倍になるため確実に検出でき、時刻のジッタ（数 % 程度）では警告しない値。
 """
 
+DEFAULT_GROUP_NAME = "データ"
+"""ファイルを開くだけのときの登録先（実験・セッション・試技）の名前。画面の一覧には出さない。"""
+
 _UTF8_BOM = b"\xef\xbb\xbf"
+_HASH_CHUNK_BYTES = 1024 * 1024
+_ENCODING_CANDIDATES = ("utf-8", "cp932")
+"""文字コードの候補（UTF-8 は誤判定しにくいので先に試す）。"""
+_DELIMITER_CANDIDATES = (",", "\t", ";", " ")
+"""区切り文字の候補（同点なら先のものを選ぶ）。"""
+_LAYOUT_SAMPLE_LINES = 50
+"""区切り文字と前置きの行数の判定に使う、先頭の行数。"""
+_TIME_KEYWORDS = ("time", "timestamp", "elapsed", "時刻", "時間", "経過")
+"""時刻列の名前に含まれる語。"""
+_TIME_BASE_NAMES = frozenset({"t", "sec", "second", "seconds", "秒"})
+"""単位の部分を除いた列名がこれと一致すれば時刻列とみなす（"t"、"t_ms" など）。"""
+_UNIT_IN_BRACKETS = re.compile(r"[\[(（［]\s*([^\[\]()（）［］]+?)\s*[\])）］]\s*$")
+"""列名の末尾の括弧に書かれた単位（"force[N]"、"accel (m/s^2)" など）。"""
+_TIME_UNIT_WORDS = {
+    "ms": TimeUnit.MILLISECOND,
+    "msec": TimeUnit.MILLISECOND,
+    "ミリ秒": TimeUnit.MILLISECOND,
+    "us": TimeUnit.MICROSECOND,
+    "usec": TimeUnit.MICROSECOND,
+    "µs": TimeUnit.MICROSECOND,
+    "μs": TimeUnit.MICROSECOND,
+    "マイクロ秒": TimeUnit.MICROSECOND,
+    "ns": TimeUnit.NANOSECOND,
+    "nsec": TimeUnit.NANOSECOND,
+    "ナノ秒": TimeUnit.NANOSECOND,
+    "s": TimeUnit.SECOND,
+    "sec": TimeUnit.SECOND,
+    "秒": TimeUnit.SECOND,
+}
+"""列名に書かれた時刻の単位。"""
 
 
 class ImportBlockedError(Exception):
@@ -161,6 +203,129 @@ class DataImporter:
         rows = [[_format_cell(value) for value in row] for row in head.rows()]
         return FilePreview(columns=columns, rows=rows, issues=issues)
 
+    def suggest(self, path: Path, *, shares_trial_clock: bool = True) -> ImportSuggestion:
+        """ファイルの中身から取り込みの指定を決める（ファイルは変更しない）。
+
+        時刻列が特定できない、数値の列がない、構造にエラーがあるといった場合は、推測で取り込まず
+        ``request`` を None にして確認を求める。時刻の単位が列名から分からない場合は秒とみなすが、
+        誤っていると時間軸が丸ごとずれるので、仮定として必ず知らせる。
+
+        Args:
+            path: 開くファイル。
+            shares_trial_clock: 同じ試技の他のファイルと同じ時計で記録したなら True。
+
+        Returns:
+            決めた指定、または確認が必要な理由。
+        """
+        file_format = file_format_of(path)
+        try:
+            raw = path.read_bytes()
+        except OSError as exc:
+            return ImportSuggestion(
+                file_format=file_format, review_reasons=[f"ファイルを読み込めません: {exc}"]
+            )
+        read_options = _sniff_read_options(raw, file_format)
+        preview = self.preview(path, file_format, read_options)
+        suggestion = ImportSuggestion(file_format=file_format, read_options=read_options)
+        errors = [i.description for i in preview.issues if i.severity is IssueSeverity.ERROR]
+        if errors:
+            return suggestion.model_copy(update={"review_reasons": errors})
+        time_column = _confident_time_column(preview)
+        if time_column is None:
+            return suggestion.model_copy(
+                update={"review_reasons": ["時刻の列を判定できませんでした。指定してください"]}
+            )
+        channels = _channel_specs(preview, time_column)
+        if not channels:
+            return suggestion.model_copy(
+                update={"review_reasons": ["時刻以外の数値の列が見つかりませんでした"]}
+            )
+        assumptions: list[str] = []
+        time_unit = parse_time_unit(time_column)
+        if time_unit is None:
+            time_unit = TimeUnit.SECOND
+            assumptions.append(
+                f"時刻列「{time_column}」の単位が列名から分からないため、秒として読みました。"
+                "違うときは「読み込み設定を指定して開く」から指定してください"
+            )
+        if read_options.skip_rows > 0:
+            assumptions.append(f"先頭の {read_options.skip_rows} 行は前置きとして読み飛ばしました")
+        experiment_name, session_name, trial_name = self.default_target_names()
+        request = ImportRequest(
+            file_format=file_format,
+            read_options=read_options,
+            time_column=time_column,
+            time_unit=time_unit,
+            channels=channels,
+            experiment_name=experiment_name,
+            session_name=session_name,
+            trial_name=trial_name,
+            source_name=self.unique_source_name(path.stem, experiment_name, session_name),
+            shares_trial_clock=shares_trial_clock,
+        )
+        return suggestion.model_copy(update={"request": request, "assumptions": assumptions})
+
+    def default_target_names(self) -> tuple[str, str, str]:
+        """ファイルを開くだけのときの登録先の名前を返す。
+
+        既に試技があるプロジェクトでは最初の試技を使う（別の階層を増やさないため）。
+
+        Returns:
+            (実験名, セッション名, 試技名)。
+        """
+        database = self.store.database
+        for experiment in database.list_entities(Experiment):
+            for session in database.list_entities(Session, experiment_id=experiment.id):
+                for trial in database.list_entities(Trial, session_id=session.id):
+                    return experiment.name, session.name, trial.name
+        return DEFAULT_GROUP_NAME, DEFAULT_GROUP_NAME, DEFAULT_GROUP_NAME
+
+    def unique_source_name(self, stem: str, experiment_name: str, session_name: str) -> str:
+        """同じ試技の中で重ならない Source 名を返す（"name"、"name_2"、"name_3" …）。
+
+        別のフォルダの同じ名前のファイルも開けるようにするため。
+
+        Args:
+            stem: 名前の元（通常はファイル名の拡張子を除いた部分）。
+            experiment_name: 登録先の実験名。
+            session_name: 登録先のセッション名。
+
+        Returns:
+            重ならない名前。
+        """
+        database = self.store.database
+        used: set[str] = set()
+        for experiment in database.list_entities(Experiment, name=experiment_name):
+            sessions = database.list_entities(
+                Session, experiment_id=experiment.id, name=session_name
+            )
+            for session in sessions:
+                for trial in database.list_entities(Trial, session_id=session.id):
+                    sources = database.list_entities(Source, trial_id=trial.id)
+                    used.update(source.name for source in sources)
+        candidate = stem
+        number = 2
+        while candidate in used:
+            candidate = f"{stem}_{number}"
+            number += 1
+        return candidate
+
+    def has_same_file(self, path: Path) -> bool:
+        """同じ内容のファイルをプロジェクトに取り込み済みかを返す。
+
+        Args:
+            path: 調べるファイル。
+
+        Returns:
+            取り込み済みなら True（読めないファイルは False。取り込みの段階で理由を示す）。
+        """
+        try:
+            digest = file_sha256(path)
+        except OSError:
+            return False
+        sources = self.store.database.list_entities(Source)
+        return any(source.original_sha256 == digest for source in sources)
+
     # --- 2. 取り込み先の解決 ---------------------------------------------------
 
     def resolve_targets(self, request: ImportRequest) -> ImportTargets:
@@ -214,6 +379,25 @@ class DataImporter:
 
     # --- 3. 検証・コピー・正規化 -----------------------------------------------
 
+    def check(self, path: Path, request: ImportRequest) -> list[DataIssue]:
+        """取り込む前に、ファイル全体を指定どおりに検証して異常を返す（何も書き込まない）。
+
+        取り込みダイアログで、データの内容に関する警告やエラー（NaN、時刻の逆行、
+        数値でない値など）を、取り込みを確定する前に見せるために使う。
+
+        Args:
+            path: 取り込むファイル（読み取りのみ）。
+            request: 取り込みの指定。
+
+        Returns:
+            検出した異常（エラーと警告）。異常がなければ空。
+        """
+        try:
+            _, _, _, issues = _validate_file(path, request)
+        except ImportBlockedError as exc:
+            return exc.issues
+        return issues
+
     def prepare(self, path: Path, request: ImportRequest, trial_id: UUID) -> PreparedImport:
         """ファイル全体を検証し、元ファイルのコピーと正規化データを書き込む（DB には触れない）。
 
@@ -229,63 +413,7 @@ class DataImporter:
             ImportBlockedError: エラーの異常がある場合（何も書き込まない）。
             FileExistsError: 書き込み先が既に存在する場合（通常は起こらない）。
         """
-        try:
-            raw = path.read_bytes()
-        except OSError as exc:
-            raise ImportBlockedError([_read_error(f"読み込めません: {exc}")]) from exc
-
-        header, table, issues = _inspect_structure(raw, request.file_format, request.read_options)
-        # 構造が読めない（空・文字コードの誤りなど）場合は、
-        # 列の有無を調べても意味がないので打ち切る。
-        if _has_error(issues) or table is None:
-            raise ImportBlockedError(issues)
-        selected = [spec.column for spec in request.channels]
-        if request.time_column is not None:
-            selected = [request.time_column, *selected]
-        issues.extend(
-            DataIssue(
-                kind=DataIssueKind.INVALID_COLUMN,
-                description=f"列 {name!r} がファイルにありません",
-                column=name,
-                severity=IssueSeverity.ERROR,
-            )
-            for name in selected
-            if name not in header
-        )
-        if _has_error(issues) or table is None:
-            raise ImportBlockedError(issues)
-
-        try:
-            frame = _read_table(
-                table, request.file_format, request.read_options, columns=selected, n_rows=None
-            )
-        except pl.exceptions.PolarsError as exc:
-            raise ImportBlockedError(
-                [*issues, _read_error(f"表として読み込めません: {exc}")]
-            ) from exc
-        # row_numbers は、空行を除いた後の行からファイル上のデータ行番号への対応。
-        # 報告する位置がファイルとずれないようにするため。
-        frame, row_numbers, blank_issues = _drop_blank_rows(frame)
-        numeric, conversion_issues = _to_float_columns(frame, selected, row_numbers)
-        issues.extend(blank_issues)
-        issues.extend(conversion_issues)
-        if _has_error(issues):
-            raise ImportBlockedError(issues)
-
-        if request.time_column is not None:
-            raw_time = numeric[request.time_column].to_numpy().astype(np.float64)
-            time_s = to_seconds(raw_time, request.time_unit)
-            issues.extend(_check_time(time_s, request.time_column, row_numbers))
-        else:
-            interval = request.sample_interval_s if request.sample_interval_s is not None else 1.0
-            time_s = np.arange(numeric.height, dtype=np.float64) * interval
-        for spec in request.channels:
-            issues.extend(
-                _check_channel(frame[spec.column], numeric[spec.column], spec.column, row_numbers)
-            )
-        if _has_error(issues):
-            raise ImportBlockedError(issues)
-
+        raw, numeric, time_s, issues = _validate_file(path, request)
         prepared = self._build_entities(path, raw, request, trial_id, time_s, issues)
         dataset = pl.DataFrame(
             {
@@ -435,6 +563,268 @@ class DataImporter:
         prepared = self.prepare(path, request, targets.trial.id)
         self.commit(prepared, targets)
         return prepared
+
+
+# ---------------------------------------------------------------------------
+# ファイル全体の検証（モジュール内部用）
+# ---------------------------------------------------------------------------
+
+
+def _validate_file(
+    path: Path, request: ImportRequest
+) -> tuple[bytes, pl.DataFrame, FloatArray, list[DataIssue]]:
+    """ファイル全体を指定どおりに読み、取り込みの前提を満たすか検証する（何も書き込まない）。
+
+    Args:
+        path: 取り込むファイル。
+        request: 取り込みの指定。
+
+    Returns:
+        (ファイルの内容, 数値に変換した選択列, 秒に換算した時刻, 警告)。
+
+    Raises:
+        ImportBlockedError: エラーの異常がある場合。
+    """
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise ImportBlockedError([_read_error(f"読み込めません: {exc}")]) from exc
+
+    header, table, issues = _inspect_structure(raw, request.file_format, request.read_options)
+    # 構造が読めない（空・文字コードの誤りなど）場合は、
+    # 列の有無を調べても意味がないので打ち切る。
+    if _has_error(issues) or table is None:
+        raise ImportBlockedError(issues)
+    selected = [spec.column for spec in request.channels]
+    if request.time_column is not None:
+        selected = [request.time_column, *selected]
+    issues.extend(
+        DataIssue(
+            kind=DataIssueKind.INVALID_COLUMN,
+            description=f"列 {name!r} がファイルにありません",
+            column=name,
+            severity=IssueSeverity.ERROR,
+        )
+        for name in selected
+        if name not in header
+    )
+    if _has_error(issues):
+        raise ImportBlockedError(issues)
+
+    try:
+        frame = _read_table(
+            table, request.file_format, request.read_options, columns=selected, n_rows=None
+        )
+    except pl.exceptions.PolarsError as exc:
+        raise ImportBlockedError([*issues, _read_error(f"表として読み込めません: {exc}")]) from exc
+    # row_numbers は、空行を除いた後の行からファイル上のデータ行番号への対応。
+    # 報告する位置がファイルとずれないようにするため。
+    frame, row_numbers, blank_issues = _drop_blank_rows(frame)
+    numeric, conversion_issues = _to_float_columns(frame, selected, row_numbers)
+    issues.extend(blank_issues)
+    issues.extend(conversion_issues)
+    if _has_error(issues):
+        raise ImportBlockedError(issues)
+
+    if request.time_column is not None:
+        raw_time = numeric[request.time_column].to_numpy().astype(np.float64)
+        time_s = to_seconds(raw_time, request.time_unit)
+        issues.extend(_check_time(time_s, request.time_column, row_numbers))
+    else:
+        interval = request.sample_interval_s if request.sample_interval_s is not None else 1.0
+        time_s = np.arange(numeric.height, dtype=np.float64) * interval
+    for spec in request.channels:
+        issues.extend(
+            _check_channel(frame[spec.column], numeric[spec.column], spec.column, row_numbers)
+        )
+    if _has_error(issues):
+        raise ImportBlockedError(issues)
+    return raw, numeric, time_s, issues
+
+
+# ---------------------------------------------------------------------------
+# ファイルの読み方の判定
+# ---------------------------------------------------------------------------
+
+
+def file_sha256(path: Path) -> str:
+    """ファイルの SHA-256 を返す（大きなファイルでも少しずつ読む）。
+
+    Args:
+        path: ファイル。
+
+    Returns:
+        16 進数の文字列。
+
+    Raises:
+        OSError: 読めない場合。
+    """
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        while chunk := file.read(_HASH_CHUNK_BYTES):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def file_format_of(path: Path) -> SourceFormat:
+    """ファイル名の拡張子から形式を判定する。
+
+    Args:
+        path: ファイル。
+
+    Returns:
+        ファイル形式（.parquet と .tsv 以外は CSV として読む）。
+    """
+    suffix = path.suffix.lower()
+    return {".parquet": SourceFormat.PARQUET, ".tsv": SourceFormat.TSV}.get(
+        suffix, SourceFormat.CSV
+    )
+
+
+def parse_time_unit(column: str) -> TimeUnit | None:
+    """時刻列の名前に書かれた単位を読み取る（"time_ms"、"t [s]"、"時刻(ミリ秒)" など）。
+
+    単語の区切りを見て判定する。"times" の末尾の s を秒と読まないようにするため。
+
+    Args:
+        column: 時刻列の名前。
+
+    Returns:
+        単位。名前から分からなければ None。
+    """
+    name = column.strip().lower()
+    bracket = _UNIT_IN_BRACKETS.search(name)
+    if bracket is not None:
+        return _TIME_UNIT_WORDS.get(bracket.group(1))
+    last_word = re.split(r"[\s_\-.]+", name)[-1]
+    return _TIME_UNIT_WORDS.get(last_word) if last_word != name else None
+
+
+def guess_time_column(preview: FilePreview) -> str | None:
+    """時刻列の候補を返す（確認画面の初期値に使う）。
+
+    Args:
+        preview: ファイルのプレビュー。
+
+    Returns:
+        時刻らしい名前の数値の列。なければ最初の数値の列。数値の列がなければ None。
+    """
+    numeric = [column.name for column in preview.columns if column.is_numeric]
+    return _confident_time_column(preview) or (numeric[0] if numeric else None)
+
+
+def _confident_time_column(preview: FilePreview) -> str | None:
+    """名前から時刻列だと判断できる数値の列を返す。
+
+    Args:
+        preview: ファイルのプレビュー。
+
+    Returns:
+        列名。判断できなければ None。
+    """
+    for column in preview.columns:
+        if column.is_numeric and _looks_like_time(column.name):
+            return column.name
+    return None
+
+
+def _looks_like_time(name: str) -> bool:
+    """列名が時刻らしいかを返す。
+
+    Args:
+        name: 列名。
+
+    Returns:
+        時刻らしければ True。
+    """
+    lowered = name.strip().lower()
+    if any(word in lowered for word in _TIME_KEYWORDS):
+        return True
+    base = re.split(r"[\s_\-.\[(（［]+", _UNIT_IN_BRACKETS.sub("", lowered))[0]
+    return base in _TIME_BASE_NAMES
+
+
+def _channel_specs(preview: FilePreview, time_column: str) -> list[ChannelImportSpec]:
+    """時刻列以外の数値の列をチャンネルにする（列名の括弧に書かれた単位を読み取る）。
+
+    Args:
+        preview: ファイルのプレビュー。
+        time_column: 時刻列の名前。
+
+    Returns:
+        チャンネルの指定（ファイル内の順）。
+    """
+    specs: list[ChannelImportSpec] = []
+    for column in preview.columns:
+        name = column.name
+        if not column.is_numeric or name in (time_column, DATASET_TIME_COLUMN):
+            continue
+        if not name.strip():
+            continue
+        bracket = _UNIT_IN_BRACKETS.search(name)
+        specs.append(ChannelImportSpec(column=name, unit=bracket.group(1) if bracket else None))
+    return specs
+
+
+def _sniff_read_options(raw: bytes, file_format: SourceFormat) -> ReadOptions:
+    """ファイルの内容から、文字コード・区切り文字・前置きの行数を判定する。
+
+    Args:
+        raw: ファイルの内容。
+        file_format: ファイル形式。
+
+    Returns:
+        読み込み条件。判定できない部分は既定値のまま（確認は後段の検証に任せる）。
+    """
+    if file_format is SourceFormat.PARQUET:
+        return ReadOptions()
+    encoding, text = _decode_with_candidates(raw)
+    delimiters = ("\t",) if file_format is SourceFormat.TSV else _DELIMITER_CANDIDATES
+    delimiter, skip_rows = _sniff_layout(text, delimiters)
+    return ReadOptions(delimiter=delimiter, encoding=encoding, skip_rows=skip_rows)
+
+
+def _decode_with_candidates(raw: bytes) -> tuple[str, str]:
+    """候補の文字コードで順に読む。
+
+    Args:
+        raw: ファイルの内容。
+
+    Returns:
+        (文字コード, 読んだ文字列)。どれでも読めなければ ("utf-8", "") を返す
+        （後段の検証で文字コードのエラーとして説明する）。
+    """
+    for encoding in _ENCODING_CANDIDATES:
+        try:
+            return encoding, raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return _ENCODING_CANDIDATES[0], ""
+
+
+def _sniff_layout(text: str, delimiters: tuple[str, ...]) -> tuple[str, int]:
+    """区切り文字と、ヘッダーの前の前置きの行数を判定する。
+
+    データの行は区切り文字の数が揃うという性質を使う。候補ごとに先頭の行の区切り文字の数を数え、
+    最も多くの行に共通する数（1 以上）を持つ候補を選び、その数を持つ最初の行をヘッダーとみなす。
+
+    Args:
+        text: ファイルの内容。
+        delimiters: 区切り文字の候補（同点なら先のもの）。
+
+    Returns:
+        (区切り文字, ヘッダーの前の行数)。
+    """
+    lines = text.splitlines()[:_LAYOUT_SAMPLE_LINES]
+    best = (delimiters[0], 0)
+    best_score = 0
+    for delimiter in delimiters:
+        counts = [len(next(csv.reader([line], delimiter=delimiter), [])) - 1 for line in lines]
+        common = Counter(count for count in counts if count > 0).most_common(1)
+        if common and common[0][1] > best_score:
+            best_score = common[0][1]
+            best = (delimiter, counts.index(common[0][0]))
+    return best
 
 
 # ---------------------------------------------------------------------------
