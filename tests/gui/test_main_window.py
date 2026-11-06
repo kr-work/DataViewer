@@ -339,6 +339,29 @@ def test_reopening_same_file_resumes_previous_work(
     again.close()
 
 
+def test_reopening_after_abnormal_exit_still_shows_graph(
+    qtbot: QtBot, synthetic_dataset: SyntheticDataset
+) -> None:
+    """異常終了で表示設定が残っていなくても、開いたときに空の画面にしない。"""
+    data, _ = synthetic_dataset
+    path = data / "trial_001/io_pair.csv"
+    window = _window(qtbot)
+    window.open_files([path])
+    _wait_open(qtbot, window)
+    store = window.store
+    assert store is not None
+    root = store.root
+    window.close()
+    (root / ProjectDirectory.VIEWS / "main.json").unlink()
+
+    again = _window(qtbot)
+    again.open_files([path])
+    _wait_open(qtbot, again)
+    assert again.workspace.displayed_series_ids()
+    assert again.analysis_panel.input_data is not None
+    again.close()
+
+
 def test_changed_file_starts_separately(qtbot: QtBot, tmp_path: Path) -> None:
     """同じ名前でも内容が変わったファイルは別に保存し、前の結果と混ぜない。"""
     path = _write_csv(tmp_path / "a.csv", "time_s,v\n0,1\n1,2\n2,3\n")
@@ -564,6 +587,25 @@ def test_same_file_is_not_added_twice(
 
 
 # --- データの一覧 ---------------------------------------------------------------------
+
+
+def test_unit_in_column_name_is_not_repeated(qtbot: QtBot, tmp_path: Path) -> None:
+    """列名に単位が書かれたファイルでは、名前と単位を分けて表示し、処理の名前も短くなる。"""
+    rows = "\n".join(f"{index},{index % 7}" for index in range(40))
+    path = _write_csv(tmp_path / "a.csv", f"time_s,張力[N]\n{rows}\n")
+    window = _window(qtbot)
+    window.open_files([path])
+    _wait_open(qtbot, window)
+    heading = window.workspace.panels[0].readout_label.text()
+    assert "<b>張力</b> [N]" in heading
+    assert "張力[N]" not in heading
+    assert _item(window, "張力").text(1).startswith("N")
+    panel = window.analysis_panel
+    assert panel.input_label.text() == "対象: 張力 [N]"
+    panel.start_method(AnalysisKind.MOVING_AVERAGE)
+    qtbot.waitUntil(partial(_has_analyses, window), timeout=IMPORT_TIMEOUT_MS)
+    assert _item(window, "移動平均 11").text(0) == "移動平均 11"
+    window.close()
 
 
 def test_list_shows_files_and_channels_without_hierarchy(

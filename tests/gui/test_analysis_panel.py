@@ -19,6 +19,7 @@ from experiment_workbench.analysis import (
 )
 from experiment_workbench.model import (
     TWO_CHANNEL_ANALYSIS_KINDS,
+    AbsoluteParams,
     AdaptiveNoiseMethod,
     AlignmentGrid,
     AlignmentParams,
@@ -26,10 +27,20 @@ from experiment_workbench.model import (
     AnalysisSpec,
     ButterworthKind,
     ChannelData,
+    CropParams,
     DerivativeMethod,
+    DetrendParams,
+    FillGapsParams,
     KalmanModelKind,
     KalmanSettings,
+    NormalizeMode,
+    NormalizeParams,
+    OffsetMode,
+    OffsetParams,
+    ResampleParams,
     SavitzkyGolayParams,
+    ScaleParams,
+    StatisticsParams,
     StepResponseParams,
 )
 from experiment_workbench.ui.analysis_panel import (
@@ -288,9 +299,9 @@ def test_description_follows_the_chosen_filter(panel: AnalysisPanel, hierarchy: 
     """フィルタの種類を変えると、説明もその種類のものに変わる。"""
     panel.set_input(_input(hierarchy))
     panel.start_method(AnalysisKind.BUTTERWORTH)
-    assert "速い変動を取り除き" in panel.description_label.text()
+    assert "高い周波数成分を除去" in panel.description_label.text()
     _select_data(panel.butterworth_page.kind_combo, ButterworthKind.HIGHPASS.value)
-    assert "遅い変動" in panel.description_label.text()
+    assert "低い周波数成分" in panel.description_label.text()
 
 
 def test_summary_shows_headline_without_blank_lines(panel: AnalysisPanel) -> None:
@@ -414,6 +425,19 @@ def test_switching_from_akf_to_kf_clears_adaptive(
     assert kalman.adaptive is None
     panel.start_method(AnalysisKind.KALMAN, PRESET_EKF)
     assert panel.name_edit.text() == "accel EKF"
+
+
+def test_hysteresis_smooths_direction_by_default(
+    panel: AnalysisPanel, hierarchy: Hierarchy
+) -> None:
+    """ヒステリシスは既定で向きの判定を平滑化する（なしでは差が小さく見積もられるため）。"""
+    data = _input(hierarchy)  # 1 kHz
+    _set_choices(panel, data)
+    panel.set_input(data)
+    panel.start_method(AnalysisKind.HYSTERESIS)
+    params = panel.build_spec().hysteresis
+    assert params is not None
+    assert params.smoothing_cutoff_hz == 5.0
 
 
 def test_two_channel_buttons_need_two_channels(panel: AnalysisPanel, hierarchy: Hierarchy) -> None:
@@ -713,7 +737,7 @@ def test_non_numeric_value_shows_error_and_does_not_run(
     panel.butterworth_page.low_edit.setText("abc")
     with qtbot.assertNotEmitted(panel.run_requested):
         panel.request_run()
-    assert "「カットオフ周波数（下限）」には数値を入力してください" in panel.status_label.text()
+    assert "「カットオフ周波数」には数値を入力してください" in panel.status_label.text()
 
 
 def test_invalid_combination_shows_validation_error(
@@ -863,3 +887,183 @@ def test_collapsible_section_shows_body_when_opened(qtbot: QtBot) -> None:
     assert not body.isVisibleTo(section)
     section.toggle_button.click()
     assert body.isVisibleTo(section)
+
+
+# --- 用語と入力欄 -----------------------------------------------------------------
+
+
+def test_band_filter_names_lower_and_upper_cutoff(
+    panel: AnalysisPanel, hierarchy: Hierarchy
+) -> None:
+    """帯域の特性では、下側と上側のカットオフ周波数として表示する。"""
+    panel.set_input(_input(hierarchy))
+    page = panel.butterworth_page
+    assert page.low_edit.label == "カットオフ周波数"
+    _select_data(page.kind_combo, ButterworthKind.BANDPASS.value)
+    assert page.low_edit.label == "下側カットオフ周波数"
+
+
+def test_nyquist_frequency_is_shown(panel: AnalysisPanel, hierarchy: Hierarchy) -> None:
+    """カットオフ周波数の上限の目安として、ナイキスト周波数を表示する。"""
+    panel.set_input(_input(hierarchy))  # 1 kHz
+    assert panel.butterworth_page.nyquist_label.text() == "ナイキスト周波数 500 Hz"
+
+
+def test_padding_option_applies_only_to_zero_phase(
+    panel: AnalysisPanel, hierarchy: Hierarchy
+) -> None:
+    """端点処理はゼロ位相フィルタでだけ使うので、それ以外では選べない。"""
+    panel.set_input(_input(hierarchy))
+    page = panel.butterworth_page
+    page.zero_phase_check.setChecked(False)
+    assert not page.padtype_combo.isEnabled()
+    page.zero_phase_check.setChecked(True)
+    assert page.padtype_combo.isEnabled()
+
+
+def test_window_length_is_also_shown_as_time(panel: AnalysisPanel, hierarchy: Hierarchy) -> None:
+    """窓長は、サンプル数に加えて時間に換算した値も表示する。"""
+    panel.set_input(_input(hierarchy))  # 1 kHz
+    panel.start_method(AnalysisKind.MOVING_AVERAGE)
+    assert panel.moving_average_page.window_slider.note_label.text() == "11 ms に相当"
+    panel.moving_average_page.window_spin.setValue(2001)
+    assert panel.moving_average_page.window_slider.note_label.text() == "2.001 s に相当"
+
+
+def test_kalman_noise_labels_show_units_of_input(
+    panel: AnalysisPanel, hierarchy: Hierarchy
+) -> None:
+    """雑音の項目名に、入力の単位から決まる単位を表示する（q の単位は階数で変わる）。"""
+    panel.set_input(_input(hierarchy))  # 単位は m/s^2
+    page = panel.kalman_page
+    assert page._kinematic_sigma_label.text() == "観測雑音の標準偏差 σ [m/s^2]"
+    assert page._kinematic_q_label.text() == "プロセス雑音 PSD q [(m/s^2)²/s^3]"
+    page.kinematic_order_spin.setValue(2)
+    assert page._kinematic_q_label.text() == "プロセス雑音 PSD q [(m/s^2)²/s^5]"
+
+
+def test_derivative_shows_only_fields_of_chosen_method(
+    panel: AnalysisPanel, hierarchy: Hierarchy
+) -> None:
+    """微分の計算方法に関係しない欄は出さない。"""
+    panel.set_input(_input(hierarchy))
+    panel.start_method(AnalysisKind.DERIVATIVE)
+    page = panel.derivative_page
+    assert page.edge_order_spin.isVisibleTo(page)
+    assert not page.window_spin.isVisibleTo(page)
+    _select_data(page.method_combo, DerivativeMethod.SAVITZKY_GOLAY.value)
+    assert not page.edge_order_spin.isVisibleTo(page)
+    assert page.window_spin.isVisibleTo(page)
+
+
+# --- 値の変換・時間の処理の条件 -------------------------------------------------------
+
+
+def test_crop_always_uses_range(qtbot: QtBot, panel: AnalysisPanel, hierarchy: Hierarchy) -> None:
+    """切り出しは範囲が必須なので、範囲の指定のチェックを出さずに帯を出す。"""
+    panel.set_input(_input(hierarchy))
+    panel.alignment_page.set_range(0.5, 1.0)
+    with qtbot.waitSignal(panel.range_selection_changed, timeout=1000) as blocker:
+        panel.start_method(AnalysisKind.CROP)
+    assert blocker.args == [True]
+    page = panel.alignment_page
+    assert page.isVisibleTo(panel)
+    assert not page.range_check.isVisibleTo(page)
+    assert not page.output_combo.isVisibleTo(page)
+    assert not page.details_section.isVisibleTo(page)
+    crop = panel.build_spec().crop
+    assert crop is not None
+    assert (crop.start_s, crop.end_s) == (0.5, 1.0)
+
+
+def test_offset_range_is_optional_and_hidden_for_given_value(
+    panel: AnalysisPanel, hierarchy: Hierarchy
+) -> None:
+    """平均値を差し引くときは区間を選べ、指定した値を差し引くときは区間の欄を出さない。"""
+    panel.set_input(_input(hierarchy))
+    panel.start_method(AnalysisKind.OFFSET)
+    page = panel.offset_page
+    assert panel.alignment_page.isVisibleTo(panel)
+    assert not page.value_edit.isVisibleTo(page)
+    offset = panel.build_spec().offset
+    assert offset is not None
+    assert offset.start_s is None
+    _select_data(page.mode_combo, OffsetMode.VALUE.value)
+    assert not panel.alignment_page.isVisibleTo(panel)
+    assert page.value_edit.isVisibleTo(page)
+    assert not panel.range_selection_active()
+
+
+def test_resample_starts_at_half_of_input_rate(panel: AnalysisPanel, hierarchy: Hierarchy) -> None:
+    """リサンプリングの周波数の初期値は入力の半分（1 kHz なら 500 Hz）。"""
+    panel.set_input(_input(hierarchy))
+    panel.start_method(AnalysisKind.RESAMPLE)
+    resample = panel.build_spec().resample
+    assert resample is not None
+    assert resample.rate_hz == 500.0
+    assert resample.anti_alias
+    assert panel.name_edit.text() == "accel 500 Hz"
+
+
+def test_scale_refuses_zero_gain_in_panel(
+    qtbot: QtBot, panel: AnalysisPanel, hierarchy: Hierarchy
+) -> None:
+    """倍率 0 は理由を表示して実行しない。"""
+    panel.set_input(_input(hierarchy))
+    panel.start_method(AnalysisKind.SCALE)
+    panel.scale_page.gain_edit.set_value(0.0)
+    with qtbot.assertNotEmitted(panel.run_requested):
+        panel.request_run()
+    assert "倍率" in panel.status_label.text()
+
+
+def test_fill_limit_field_appears_when_enabled(panel: AnalysisPanel, hierarchy: Hierarchy) -> None:
+    """欠損の長さの上限は、チェックしたときだけ条件に入る。"""
+    panel.set_input(_input(hierarchy))
+    panel.start_method(AnalysisKind.FILL_GAPS)
+    page = panel.fill_gaps_page
+    fill = panel.build_spec().fill_gaps
+    assert fill is not None
+    assert fill.max_gap_s is None
+    page.limit_check.setChecked(True)
+    page.limit_edit.set_value(0.5)
+    fill = panel.build_spec().fill_gaps
+    assert fill is not None
+    assert fill.max_gap_s == 0.5
+
+
+@pytest.mark.parametrize(
+    ("kind", "field", "params"),
+    [
+        (AnalysisKind.OFFSET, "offset", OffsetParams(start_s=0.25, end_s=0.75)),
+        (AnalysisKind.OFFSET, "offset", OffsetParams(mode=OffsetMode.VALUE, value=2.5)),
+        (AnalysisKind.SCALE, "scale", ScaleParams(gain=9.8, offset=1.0, unit="N")),
+        (AnalysisKind.DETREND, "detrend", DetrendParams(order=3)),
+        (AnalysisKind.ABSOLUTE, "absolute", AbsoluteParams()),
+        (AnalysisKind.NORMALIZE, "normalize", NormalizeParams(mode=NormalizeMode.PEAK)),
+        (AnalysisKind.CROP, "crop", CropParams(start_s=0.25, end_s=0.75)),
+        (AnalysisKind.RESAMPLE, "resample", ResampleParams(rate_hz=250.0, anti_alias=False)),
+        (AnalysisKind.FILL_GAPS, "fill_gaps", FillGapsParams(max_gap_s=0.5)),
+        (
+            AnalysisKind.STATISTICS,
+            "statistics",
+            StatisticsParams(start_s=0.5, end_s=1.5, n_bins=20),
+        ),
+    ],
+    ids=str,
+)
+def test_saved_processing_is_loaded_back(
+    panel: AnalysisPanel,
+    hierarchy: Hierarchy,
+    kind: AnalysisKind,
+    field: str,
+    params: object,
+) -> None:
+    """保存した処理を読み込むと、すべての条件が同じ値で戻る。"""
+    data = _input(hierarchy)
+    saved = AnalysisSpec.model_validate(
+        {"name": "保存", "input_channel_id": data.channel.id, "kind": kind, field: params}
+    )
+    panel.load_spec(saved, data)
+    rebuilt = panel.build_spec()
+    assert rebuilt.model_dump(exclude={"created_at"}) == saved.model_dump(exclude={"created_at"})

@@ -788,7 +788,7 @@ def test_click_shows_value_only_then(workspace: StackedPlotWorkspace) -> None:
 
 
 def test_result_makes_raw_line_grey_and_named(workspace: StackedPlotWorkspace) -> None:
-    """結果を重ねると、元の線は「元データ」としてグレーになり、結果は条件の名前で出る。"""
+    """結果を重ねると、元の線は「生データ」としてグレーになり、結果は条件の名前で出る。"""
     raw = _named(_source(uuid4(), "logger"), "accel")
     result = _result_of(raw, "accel LPF 10 Hz")
     workspace.add_series(raw)
@@ -796,14 +796,14 @@ def test_result_makes_raw_line_grey_and_named(workspace: StackedPlotWorkspace) -
     workspace.add_series(result)
     text = panel.readout_label.text()
     assert "<b>accel</b> [m/s^2]" in text
-    assert "元データ" in text
+    assert "生データ" in text
     assert "LPF 10 Hz" in text
     assert "accel LPF" not in text
     assert RAW_BEHIND_RESULT in text
     workspace.hide_series(result.series_id)
     text = panel.readout_label.text()
     assert RAW_BEHIND_RESULT not in text  # 比べる相手がなければ元の色に戻す
-    assert "元データ" not in text
+    assert "生データ" not in text
 
 
 def test_result_alone_has_full_name(workspace: StackedPlotWorkspace) -> None:
@@ -815,14 +815,14 @@ def test_result_alone_has_full_name(workspace: StackedPlotWorkspace) -> None:
 
 
 def test_two_channels_in_a_panel_keep_their_names(workspace: StackedPlotWorkspace) -> None:
-    """チャンネルを重ねたパネルでは、どちらも「元データ」と呼ばず名前で見分ける。"""
+    """チャンネルを重ねたパネルでは、どちらも「生データ」と呼ばず名前で見分ける。"""
     source = _source(uuid4(), "logger")
     workspace.add_series(_named(source, "accel"))
     workspace.add_series(_named(source, "force", "N"))
     text = workspace.panels[0].readout_label.text()
     assert "<b>accel</b>" in text
     assert "<b>force</b>" in text
-    assert "元データ" not in text
+    assert "生データ" not in text
 
 
 def test_file_name_is_added_when_two_files_are_shown(workspace: StackedPlotWorkspace) -> None:

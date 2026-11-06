@@ -63,6 +63,7 @@ from experiment_workbench.validation import (
     check_selected_settings,
     check_series_arrays,
     check_time_column_consistency,
+    check_time_range,
     check_two_channel_settings,
     check_xy_arrays,
     utc_now,
@@ -87,7 +88,14 @@ VIEW_FORMAT_VERSION = 2
 # 保存した解析（pipelines/*.json）の保存形式バージョン。
 # v2（Phase 4）: 2 チャンネルの解析（output_channel_id・alignment・step_response・hysteresis・
 # cross_correlation）を追加。v1 のファイルは、追加した項目が None としてそのまま読める。
-ANALYSIS_FORMAT_VERSION = 2
+ANALYSIS_FORMAT_VERSION = 3
+
+DEFAULT_MAX_GAP_FACTOR = 1.5
+"""時刻の間隔が、間隔の中央値のこの倍数を超えたら、行ごと欠けた区間とみなす。
+
+1 サンプル欠ければ間隔は 2 倍になるため確実に検出でき、時刻のジッタ（数 % 程度）では
+反応しない値。読み込みの警告・時刻の対応付け・リサンプリング・欠損の補間で同じ値を使う。
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -1361,7 +1369,7 @@ class AlignmentParams(WorkbenchModel):
     uniform_rate_hz: PositiveFloat | None = None
     start_s: FiniteFloat | None = None
     end_s: FiniteFloat | None = None
-    max_gap_factor: float = Field(default=1.5, gt=1.0)
+    max_gap_factor: float = Field(default=DEFAULT_MAX_GAP_FACTOR, gt=1.0)
 
     @model_validator(mode="after")
     def _check_grid_and_range(self) -> "AlignmentParams":
@@ -1577,6 +1585,8 @@ class HysteresisParams(WorkbenchModel):
         smoothing_cutoff_hz: 変化の向きの判定にだけ使う、入力のゼロ位相ローパスフィルタ
             （4 次のバターワース）のカットオフ周波数 [Hz]。None なら平滑化しない。
             X-Y の値と指標の計算には、平滑化しない値を使う。
+            微分は雑音を強調するので、雑音のある入力で平滑化しないと向きの判定が乱れて、
+            ヒステリシスが小さく見積もられる（HysteresisResult.direction_unstable で分かる）。
     """
 
     n_bins: int = Field(default=50, ge=2, le=10_000)
@@ -1617,6 +1627,8 @@ class HysteresisResult(WorkbenchModel):
         decreasing_branch: 区間の中央の入力での、減少時の出力の値（同上）。
         increasing_mask: 各サンプルが増加時なら True（表示用）。
         decreasing_mask: 各サンプルが減少時なら True（表示用）。
+        direction_unstable: 入力の変化の向きの判定が雑音で乱れていれば True。このとき増加時と
+            減少時のサンプルが混ざるので、ヒステリシスは小さく見積もられる。
         notes: 注記。
     """
 
@@ -1643,6 +1655,7 @@ class HysteresisResult(WorkbenchModel):
     decreasing_branch: FloatArray
     increasing_mask: BoolArray
     decreasing_mask: BoolArray
+    direction_unstable: bool = False
     notes: list[str] = Field(default_factory=list)
 
 
@@ -1793,6 +1806,263 @@ class KalmanSettings(WorkbenchModel):
         return self
 
 
+class OffsetMode(StrEnum):
+    """オフセット除去で差し引く基準値の決め方。"""
+
+    MEAN = "mean"
+    """区間の平均値（区間を指定しなければ全区間）。"""
+    VALUE = "value"
+    """指定した値。"""
+
+
+class OffsetParams(WorkbenchModel):
+    """オフセット除去の条件（A-15）。
+
+    Attributes:
+        mode: 基準値の決め方。
+        value: 指定した基準値（``mode`` が VALUE のとき）。
+        start_s: 平均をとる区間の開始 [s]。None なら先頭から。
+        end_s: 平均をとる区間の終了 [s]。None なら末尾まで。
+    """
+
+    mode: OffsetMode = OffsetMode.MEAN
+    value: FiniteFloat = 0.0
+    start_s: FiniteFloat | None = None
+    end_s: FiniteFloat | None = None
+
+    @model_validator(mode="after")
+    def _check_range(self) -> "OffsetParams":
+        """区間の開始が終了より前であることを確認する。
+
+        Returns:
+            検証済みの自身。
+        """
+        check_time_range(self.start_s, self.end_s)
+        return self
+
+
+class ScaleParams(WorkbenchModel):
+    """線形変換 y = gain · x + offset の条件（A-15。倍率の補正・単位換算）。
+
+    Attributes:
+        gain: 倍率（0 にすると値の情報が失われるので指定できない）。
+        offset: 切片。
+        unit: 変換後の単位。None なら、恒等変換のときだけ入力の単位を引き継ぐ。
+    """
+
+    gain: FiniteFloat = 1.0
+    offset: FiniteFloat = 0.0
+    unit: str | None = None
+
+    @field_validator("gain")
+    @classmethod
+    def _check_gain(cls, value: float) -> float:
+        """倍率が 0 でないことを確認する。
+
+        Args:
+            value: 倍率。
+
+        Returns:
+            入力と同じ値。
+
+        Raises:
+            ValueError: 倍率が 0 の場合。
+        """
+        if value == 0.0:
+            raise ValueError("倍率に 0 は指定できません")
+        return value
+
+
+class DetrendParams(WorkbenchModel):
+    """トレンド除去の条件（A-15）。
+
+    Attributes:
+        order: 最小二乗法で当てはめる多項式の次数（0: 平均値、1: 直線）。
+    """
+
+    order: int = Field(default=1, ge=0, le=10)
+
+
+class AbsoluteParams(WorkbenchModel):
+    """絶対値の条件（A-15。条件はないが、他の処理と同じ形で保存する）。"""
+
+
+class NormalizeMode(StrEnum):
+    """正規化の方法。"""
+
+    Z_SCORE = "z_score"
+    """平均を引いて標準偏差で割る（平均 0、標準偏差 1）。"""
+    MIN_MAX = "min_max"
+    """最小値を 0、最大値を 1 にする。"""
+    PEAK = "peak"
+    """絶対値の最大で割る（ピークを ±1 にする）。"""
+
+
+class NormalizeParams(WorkbenchModel):
+    """正規化の条件（A-15）。
+
+    Attributes:
+        mode: 正規化の方法。
+    """
+
+    mode: NormalizeMode = NormalizeMode.Z_SCORE
+
+
+class CropParams(WorkbenchModel):
+    """区間の切り出しの条件（A-16）。
+
+    Attributes:
+        start_s: 開始 [s]。
+        end_s: 終了 [s]。
+    """
+
+    start_s: FiniteFloat
+    end_s: FiniteFloat
+
+    @model_validator(mode="after")
+    def _check_range(self) -> "CropParams":
+        """区間の開始が終了より前であることを確認する。
+
+        Returns:
+            検証済みの自身。
+        """
+        check_time_range(self.start_s, self.end_s)
+        return self
+
+
+class ResampleParams(WorkbenchModel):
+    """リサンプリングの条件（A-16）。
+
+    Attributes:
+        rate_hz: 変換後のサンプリング周波数 [Hz]。
+        method: 補間方法。
+        anti_alias: 周波数を下げるときにアンチエイリアスフィルタをかけるなら True。
+        max_gap_factor: 欠損区間とみなす時刻の間隔の、間隔の中央値に対する倍率。
+    """
+
+    rate_hz: PositiveFloat
+    method: InterpolationMethod = InterpolationMethod.LINEAR
+    anti_alias: bool = True
+    max_gap_factor: float = Field(default=DEFAULT_MAX_GAP_FACTOR, gt=1.0)
+
+
+class ResampleResult(WorkbenchModel):
+    """リサンプリングの結果。
+
+    Attributes:
+        time_s: 等間隔の時刻 [s]。
+        values: リサンプリングした値（欠損区間は NaN）。
+        source_rate_hz: 元のサンプリング周波数 [Hz]。
+        anti_aliased: アンチエイリアスフィルタをかけたなら True。
+        notes: 注記。
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    time_s: FloatArray
+    values: FloatArray
+    source_rate_hz: float
+    anti_aliased: bool
+    notes: list[str] = Field(default_factory=list)
+
+
+class FillGapsParams(WorkbenchModel):
+    """欠損の補間の条件（A-16）。
+
+    Attributes:
+        method: 補間方法。
+        max_gap_s: 補間する欠損の長さの上限 [s]（前後の有効な値の時刻の差）。
+            None なら上限なし。
+    """
+
+    method: InterpolationMethod = InterpolationMethod.LINEAR
+    max_gap_s: PositiveFloat | None = None
+
+
+class GapFillResult(WorkbenchModel):
+    """欠損の補間の結果。
+
+    Attributes:
+        values: 補間後の値（埋めなかった欠損は NaN のまま）。
+        filled_mask: 補間で埋めたサンプルなら True。
+        n_missing: 元の欠損（NaN）の数。
+        n_filled: 埋めた欠損の数。
+        n_time_gaps: 時刻が飛んでいる箇所の数（行ごと欠けた区間。NaN とは別に数える）。
+        longest_time_gap_s: 最も長い時刻の飛び [s]。飛びがなければ None。
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    values: FloatArray
+    filled_mask: BoolArray
+    n_missing: NonNegativeInt
+    n_filled: NonNegativeInt
+    n_time_gaps: NonNegativeInt = 0
+    longest_time_gap_s: FiniteFloat | None = None
+
+
+class StatisticsParams(WorkbenchModel):
+    """区間統計の条件（A-17）。
+
+    Attributes:
+        start_s: 区間の開始 [s]。None なら先頭から。
+        end_s: 区間の終了 [s]。None なら末尾まで。
+        n_bins: ヒストグラムの階級数。
+    """
+
+    start_s: FiniteFloat | None = None
+    end_s: FiniteFloat | None = None
+    n_bins: int = Field(default=50, ge=2, le=10_000)
+
+    @model_validator(mode="after")
+    def _check_range(self) -> "StatisticsParams":
+        """区間の開始が終了より前であることを確認する。
+
+        Returns:
+            検証済みの自身。
+        """
+        check_time_range(self.start_s, self.end_s)
+        return self
+
+
+class SectionStatistics(WorkbenchModel):
+    """区間の統計量。
+
+    Attributes:
+        start_s: 区間の最初のサンプルの時刻 [s]。
+        end_s: 区間の最後のサンプルの時刻 [s]。
+        n_samples: 計算に使ったサンプル数（欠損を除く）。
+        n_missing: 区間の中の欠損の数。
+        mean: 平均値。
+        std: 標準偏差（自由度 n - 1）。
+        rms: 実効値（二乗平均平方根）。
+        minimum: 最小値。
+        maximum: 最大値。
+        median: 中央値。
+        minimum_time_s: 最小値の時刻 [s]。
+        maximum_time_s: 最大値の時刻 [s]。
+        histogram_centers: ヒストグラムの階級の中央の値。
+        histogram_counts: ヒストグラムの度数。
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    start_s: float
+    end_s: float
+    n_samples: NonNegativeInt
+    n_missing: NonNegativeInt
+    mean: float
+    std: float
+    rms: float
+    minimum: float
+    maximum: float
+    median: float
+    minimum_time_s: float
+    maximum_time_s: float
+    histogram_centers: FloatArray
+    histogram_counts: FloatArray
+
+
 class AnalysisKind(StrEnum):
     """保存できる解析の種類（値は AnalysisSpec の項目名と同じ）。"""
 
@@ -1808,12 +2078,36 @@ class AnalysisKind(StrEnum):
     """入出力特性とヒステリシス（2 チャンネル。Phase 4）。"""
     CROSS_CORRELATION = "cross_correlation"
     """相互相関による遅れの推定（2 チャンネル。Phase 4）。"""
+    OFFSET = "offset"
+    """オフセット除去。"""
+    SCALE = "scale"
+    """線形変換（倍率の補正・単位換算）。"""
+    DETREND = "detrend"
+    """トレンド除去。"""
+    ABSOLUTE = "absolute"
+    """絶対値。"""
+    NORMALIZE = "normalize"
+    """正規化。"""
+    CROP = "crop"
+    """区間の切り出し。"""
+    RESAMPLE = "resample"
+    """等間隔へのリサンプリング。"""
+    FILL_GAPS = "fill_gaps"
+    """欠損の補間。"""
+    STATISTICS = "statistics"
+    """区間統計。"""
 
 
 TWO_CHANNEL_ANALYSIS_KINDS = frozenset(
     {AnalysisKind.STEP_RESPONSE, AnalysisKind.HYSTERESIS, AnalysisKind.CROSS_CORRELATION}
 )
 """入力と出力の 2 チャンネルを使う解析の種類（output_channel_id と alignment が要る）。"""
+
+METRIC_ANALYSIS_KINDS = TWO_CHANNEL_ANALYSIS_KINDS | {AnalysisKind.STATISTICS}
+"""時系列を出力せず、指標とグラフを返す解析の種類（解析結果の欄に表示する）。"""
+
+RANGE_ANALYSIS_KINDS = METRIC_ANALYSIS_KINDS | {AnalysisKind.CROP, AnalysisKind.OFFSET}
+"""グラフの上で時間の範囲を選べる解析の種類。"""
 
 
 class AnalysisSpec(Entity):
@@ -1842,6 +2136,15 @@ class AnalysisSpec(Entity):
         step_response: ステップ応答の条件。
         hysteresis: 入出力特性とヒステリシスの条件。
         cross_correlation: 相互相関の条件。
+        offset: オフセット除去の条件。
+        scale: 線形変換の条件。
+        detrend: トレンド除去の条件。
+        absolute: 絶対値の条件。
+        normalize: 正規化の条件。
+        crop: 区間の切り出しの条件。
+        resample: リサンプリングの条件。
+        fill_gaps: 欠損の補間の条件。
+        statistics: 区間統計の条件。
     """
 
     format_version: PositiveInt = ANALYSIS_FORMAT_VERSION
@@ -1859,6 +2162,15 @@ class AnalysisSpec(Entity):
     step_response: StepResponseParams | None = None
     hysteresis: HysteresisParams | None = None
     cross_correlation: CrossCorrelationParams | None = None
+    offset: OffsetParams | None = None
+    scale: ScaleParams | None = None
+    detrend: DetrendParams | None = None
+    absolute: AbsoluteParams | None = None
+    normalize: NormalizeParams | None = None
+    crop: CropParams | None = None
+    resample: ResampleParams | None = None
+    fill_gaps: FillGapsParams | None = None
+    statistics: StatisticsParams | None = None
 
     @model_validator(mode="after")
     def _check_params(self) -> "AnalysisSpec":
@@ -1877,6 +2189,15 @@ class AnalysisSpec(Entity):
             AnalysisKind.STEP_RESPONSE: self.step_response,
             AnalysisKind.HYSTERESIS: self.hysteresis,
             AnalysisKind.CROSS_CORRELATION: self.cross_correlation,
+            AnalysisKind.OFFSET: self.offset,
+            AnalysisKind.SCALE: self.scale,
+            AnalysisKind.DETREND: self.detrend,
+            AnalysisKind.ABSOLUTE: self.absolute,
+            AnalysisKind.NORMALIZE: self.normalize,
+            AnalysisKind.CROP: self.crop,
+            AnalysisKind.RESAMPLE: self.resample,
+            AnalysisKind.FILL_GAPS: self.fill_gaps,
+            AnalysisKind.STATISTICS: self.statistics,
         }
         check_selected_settings(
             selected=self.kind.value,
@@ -1914,7 +2235,7 @@ class PlotSeries(WorkbenchModel):
         series_id: 系列の ID（チャンネル ID、または解析の出力の ID）。
         label: 凡例やカーソル表示に使う名前。
         channel_name: チャンネル名（解析の出力は入力チャンネルの名前）。図の見出しと、
-            凡例の短い名前（"元データ"、"LPF 10 Hz" など）を作るのに使う。
+            凡例の短い名前（"生データ"、"LPF 10 Hz" など）を作るのに使う。
         unit: 単位。分からなければ None。
         source: 時間軸を決める Source（解析の出力は入力チャンネルの Source）。
         time_s: 時刻 [s]。
@@ -1952,6 +2273,17 @@ class PlotSeries(WorkbenchModel):
         return self
 
 
+class MetricDisplay(StrEnum):
+    """解析結果の表で、指標の値をどう書くか。"""
+
+    QUANTITY = "quantity"
+    """物理量（有効数字で書き、1 秒未満の時間はミリ秒で書く）。"""
+    INSTANT = "instant"
+    """時間軸の上の時刻（長さではないのでミリ秒にせず、秒のまま小数で書く）。"""
+    COUNT = "count"
+    """個数（整数で書く）。"""
+
+
 class AnalysisMetric(WorkbenchModel):
     """解析の結果の指標 1 つ（解析結果の表に表示する）。
 
@@ -1961,6 +2293,7 @@ class AnalysisMetric(WorkbenchModel):
         value: 値。求められなかった場合は None。
         unit: 単位。単位がない、または分からない場合は None。
         note: 指標の定義や、求められなかった理由。
+        display: 値の書き方。
     """
 
     key: str
@@ -1968,6 +2301,7 @@ class AnalysisMetric(WorkbenchModel):
     value: FiniteFloat | None = None
     unit: str | None = None
     note: str = ""
+    display: MetricDisplay = MetricDisplay.QUANTITY
 
 
 class ChartStyle(StrEnum):
@@ -1981,6 +2315,8 @@ class ChartStyle(StrEnum):
     """小さな点（散布図）。"""
     MARKERS = "markers"
     """目立つ印（ピークなど、少数の点）。"""
+    BARS = "bars"
+    """棒（ヒストグラム。X は等間隔の階級の中心で、棒の幅は階級の幅）。"""
 
 
 class ChartSeries(WorkbenchModel):
@@ -2022,13 +2358,19 @@ class ChartAnnotation(WorkbenchModel):
 
     凡例と別の表を見比べなくても、図の上で「どこが何か」が分かるようにするため。
 
+    文字が読み取ってほしい線に重ならないよう、置く場所はグラフごとに指定する。
+
     Attributes:
         x: 縦線の X 座標。
         text: 添える文字。
+        height: 文字を置く高さ（0 が図の下端、1 が上端）。
+        on_left: 文字を縦線の左に置くなら True。
     """
 
     x: FiniteFloat
     text: str
+    height: float = Field(default=0.92, ge=0.0, le=1.0)
+    on_left: bool = False
 
 
 class AnalysisChart(WorkbenchModel):

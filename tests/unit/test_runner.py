@@ -24,6 +24,7 @@ from experiment_workbench.analysis import (
     default_initial_state,
     default_kalman_settings,
     default_omega,
+    display_channel_name,
     estimate_noise_std,
     output_infos,
     output_series_id,
@@ -39,6 +40,7 @@ from experiment_workbench.analysis.runner import MAX_CHART_POINTS
 from experiment_workbench.model import (
     DATASET_TIME_COLUMN,
     TWO_CHANNEL_ANALYSIS_KINDS,
+    AbsoluteParams,
     AdaptiveNoiseMethod,
     AlignmentGrid,
     AlignmentParams,
@@ -49,14 +51,22 @@ from experiment_workbench.model import (
     ButterworthParams,
     ChannelData,
     ChartStyle,
+    CropParams,
     CrossCorrelationParams,
     DerivativeParams,
+    DetrendParams,
+    FillGapsParams,
     HysteresisParams,
     IntegralParams,
     KalmanModelKind,
     KalmanSettings,
     MovingAverageParams,
+    NormalizeParams,
+    OffsetParams,
+    ResampleParams,
     SavitzkyGolayParams,
+    ScaleParams,
+    StatisticsParams,
     StepResponseParams,
 )
 from experiment_workbench.validation import FloatArray
@@ -195,7 +205,7 @@ def test_filter_also_outputs_what_it_removed(hierarchy: Hierarchy) -> None:
     spec = _spec(data, AnalysisKind.BUTTERWORTH, LOWPASS, name="処理結果")
     infos = output_infos(spec, data.channel)
     assert [info.key for info in infos] == ["output", "removed"]
-    assert infos[1].label == "処理結果: 取り除いた成分"
+    assert infos[1].label == "処理結果: 除去成分"
     assert infos[1].unit == "m"
     kept, removed = run_analysis(spec, data).series
     np.testing.assert_allclose(kept.values + removed.values, data.values)
@@ -243,7 +253,7 @@ def test_kalman_summary_omits_zero_skipped_samples(hierarchy: Hierarchy) -> None
     settings = default_kalman_settings(KalmanModelKind.KINEMATIC, data)
     result = run_analysis(_spec(data, AnalysisKind.KALMAN, settings), data)
     assert result.summary == []
-    assert "推定の不確かさ" in result.headline
+    assert "イノベーションの RMS" in result.headline
 
 
 def test_derivative_and_integral_have_no_removed_output(hierarchy: Hierarchy) -> None:
@@ -261,8 +271,28 @@ def test_filter_headline_says_how_much_was_removed(hierarchy: Hierarchy) -> None
     removed = result.series[1].values
     rms = float(np.sqrt(np.mean(removed**2)))
     assert f"{rms:.3g} m" in result.headline
-    assert "取り除きました" in result.headline
+    assert "除去成分の RMS" in result.headline
     assert "%" in result.headline
+
+
+@pytest.mark.parametrize(
+    ("name", "unit", "expected"),
+    [
+        ("張力[N]", "N", "張力"),
+        ("accel (m/s^2)", "m/s^2", "accel"),
+        ("電圧（V）", "V", "電圧"),
+        ("force[N]", None, "force[N]"),  # 単位が読めていなければ名前を変えない
+        ("force[N]", "kN", "force[N]"),
+        ("[N]", "N", "[N]"),  # 除くと空になるなら除かない
+        ("accel", "m", "accel"),
+    ],
+)
+def test_display_name_drops_unit_written_in_column_name(
+    hierarchy: Hierarchy, name: str, unit: str | None, expected: str
+) -> None:
+    """列名の単位は表示の名前から除く（見出しが "張力[N] [N]" と重ならないように）。"""
+    channel = hierarchy[4].model_copy(update={"name": name, "unit": unit})
+    assert display_channel_name(channel) == expected
 
 
 def test_series_know_their_channel_name(hierarchy: Hierarchy) -> None:
@@ -437,9 +467,9 @@ def test_adaptive_kalman_summary_reports_final_noise(hierarchy: Hierarchy) -> No
     )
     result = run_analysis(_spec(data, AnalysisKind.KALMAN, settings), data)
     final = float(result.series[-1].values[-1])
-    assert len(result.summary) == 3
-    assert result.summary[1] == f"推定した観測雑音の標準偏差 √R の最終値: {final:.6g}"
-    assert result.summary[2].startswith("R の正定値化を行った時刻:")
+    assert len(result.summary) == 2  # 更新しなかった時刻は 0 個なので書かない
+    assert result.summary[0] == f"推定した観測雑音の標準偏差 √R の最終値: {final:.6g}"
+    assert result.summary[1].startswith("R の正定値化を行った時刻:")
 
 
 # --- 計算結果のキャッシュ -------------------------------------------------------
@@ -721,12 +751,26 @@ def test_step_headline_states_the_timing_in_plain_words(hierarchy: Hierarchy) ->
     spec = _two_channel_spec(data, output, AnalysisKind.STEP_RESPONSE, StepResponseParams())
     result = run_analysis(spec, data, output_data=output)
     values = _metric_values(result)
-    assert "遅れて動き始め" in result.headline
-    assert "落ち着きました" in result.headline
+    assert "応答開始遅れは" in result.headline
+    assert "整定時間 Ts は" in result.headline
     delay = values["response_delay_s"]
     assert delay is not None
     expected = f"{delay * 1000:.3g} ms" if abs(delay) < 1.0 else f"{delay:.3g} s"
     assert expected in result.headline
+
+
+def test_step_notes_stay_off_the_output_curve(hierarchy: Hierarchy) -> None:
+    """ステップ応答の注記は、曲線のない所に置く（曲線を隠さないように）。"""
+    data = _data(hierarchy, STEP_INPUT, "N")
+    output = _output_channel(hierarchy, STEP_OUTPUT)
+    spec = _two_channel_spec(data, output, AnalysisKind.STEP_RESPONSE, StepResponseParams())
+    chart = run_analysis(spec, data, output_data=output).charts[0]
+    x, y = chart.series[1].x, chart.series[1].y
+    for note in chart.annotations:
+        if note.on_left:
+            assert float(np.nanmax(y[x <= note.x])) < 100.0 * note.height
+        else:  # 右に置く文字は、曲線がその高さより上にある所に置く
+            assert float(np.interp(note.x, x, y)) > 100.0 * note.height
 
 
 def test_step_chart_uses_percent_and_readable_time_unit(hierarchy: Hierarchy) -> None:
@@ -735,7 +779,7 @@ def test_step_chart_uses_percent_and_readable_time_unit(hierarchy: Hierarchy) ->
     output = _output_channel(hierarchy, STEP_OUTPUT)
     spec = _two_channel_spec(data, output, AnalysisKind.STEP_RESPONSE, StepResponseParams())
     chart = run_analysis(spec, data, output_data=output).charts[0]
-    assert chart.y_label == "変化の割合 [%]"
+    assert chart.y_label == "正規化した応答 [%]"
     assert float(np.nanmax(chart.series[1].y)) == pytest.approx(100.0, abs=5.0)
 
 
@@ -756,18 +800,34 @@ def test_hysteresis_result_has_branches_and_regression(hierarchy: Hierarchy) -> 
     assert chart.x_label == "入力 accel [N]"
     styles = {series.label: series.style for series in chart.series}
     assert styles["測定値"] is ChartStyle.POINTS
-    assert styles["増やすとき"] is ChartStyle.LINE
-    assert styles["減らすとき"] is ChartStyle.LINE
-    assert styles["直線で近似"] is ChartStyle.DASHED
+    assert styles["増加時"] is ChartStyle.LINE
+    assert styles["減少時"] is ChartStyle.LINE
+    assert styles["回帰直線"] is ChartStyle.DASHED
     legend = [series.label for series in chart.series if series.show_in_legend]
-    assert legend == ["増やすとき", "減らすとき", "直線で近似"]  # 読み取る線だけを凡例に出す
+    assert legend == ["増加時", "減少時", "回帰直線"]  # 読み取る線だけを凡例に出す
     assert any(line.startswith("サンプル数") for line in result.conditions)
     # 差はループの間隔としては小さいので、差そのものの図も作り、最大の位置に注記を付ける。
-    assert result.charts[1].title == "増やすときと減らすときの差"
+    assert result.charts[1].title == "分岐の差（増加時 − 減少時）"
     maximum = values["max_hysteresis"]
     assert f"{maximum:.3g}" in chart.annotations[0].text
     assert "最大" in result.headline
     assert f"{maximum:.3g} V" in result.headline
+
+
+def test_headline_warns_when_direction_is_unstable(hierarchy: Hierarchy) -> None:
+    """向きの判定が乱れているときは、数値を結論として読まれないよう、結論の文で注意する。"""
+    clean = 5.0 + 5.0 * np.sin(2 * np.pi * 0.5 * TIME)
+    noisy = clean + np.random.default_rng(0).normal(0.0, 0.2, clean.size)
+    data = _data(hierarchy, noisy, "N")
+    output = _output_channel(hierarchy, 2.0 * clean)
+    plain = _two_channel_spec(data, output, AnalysisKind.HYSTERESIS, HysteresisParams())
+    assert "正しく分離できていません" in run_analysis(plain, data, output_data=output).headline
+    smoothed = _two_channel_spec(
+        data, output, AnalysisKind.HYSTERESIS, HysteresisParams(smoothing_cutoff_hz=5.0)
+    )
+    assert (
+        "正しく分離できていません" not in run_analysis(smoothed, data, output_data=output).headline
+    )
 
 
 def test_chart_points_are_thinned_but_metrics_use_all_samples(hierarchy: Hierarchy) -> None:
@@ -860,3 +920,130 @@ def test_interpolation_is_recorded_in_summary(hierarchy: Hierarchy) -> None:
     )
     result = run_analysis(spec, data, output_data=output)
     assert "補間: 線形補間（入力と出力）" in result.summary
+
+
+# --- 値の変換・時間の処理・統計 -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("kind", "params", "unit", "expected_unit", "keys"),
+    [
+        (AnalysisKind.OFFSET, OffsetParams(), "N", "N", ["output"]),
+        (AnalysisKind.SCALE, ScaleParams(gain=2.0, unit="kN"), "N", "kN", ["output"]),
+        (AnalysisKind.SCALE, ScaleParams(gain=2.0), "N", None, ["output"]),
+        (AnalysisKind.SCALE, ScaleParams(), "N", "N", ["output"]),
+        (AnalysisKind.DETREND, DetrendParams(), "N", "N", ["output", "removed"]),
+        (AnalysisKind.ABSOLUTE, AbsoluteParams(), "N", "N", ["output"]),
+        (AnalysisKind.NORMALIZE, NormalizeParams(), "N", None, ["output"]),
+        (AnalysisKind.CROP, CropParams(start_s=0.5, end_s=1.0), "N", "N", ["output"]),
+        (AnalysisKind.RESAMPLE, ResampleParams(rate_hz=50.0), "N", "N", ["output"]),
+        (AnalysisKind.FILL_GAPS, FillGapsParams(), "N", "N", ["output"]),
+    ],
+)
+def test_processing_outputs_and_units(
+    hierarchy: Hierarchy,
+    kind: AnalysisKind,
+    params: object,
+    unit: str,
+    expected_unit: str | None,
+    keys: list[str],
+) -> None:
+    """値が変わる処理の単位を正しく扱う（倍率を掛けた値に元の単位を付けない）。"""
+    data = _data(hierarchy, NOISY, unit)
+    spec = _spec(data, kind, params)
+    infos = output_infos(spec, data.channel)
+    assert [info.key for info in infos] == keys
+    assert infos[0].unit == expected_unit
+    result = run_analysis(spec, data)
+    assert result.headline
+    assert [series.series_id for series in result.series] == [info.series_id for info in infos]
+
+
+@pytest.mark.parametrize(
+    ("kind", "params", "expected"),
+    [
+        (AnalysisKind.OFFSET, OffsetParams(), False),
+        (AnalysisKind.SCALE, ScaleParams(gain=2.0), False),
+        (AnalysisKind.DETREND, DetrendParams(), False),
+        (AnalysisKind.NORMALIZE, NormalizeParams(), False),
+        (AnalysisKind.ABSOLUTE, AbsoluteParams(), True),
+        (AnalysisKind.CROP, CropParams(start_s=0.5, end_s=1.0), True),
+        (AnalysisKind.RESAMPLE, ResampleParams(rate_hz=50.0), True),
+        (AnalysisKind.FILL_GAPS, FillGapsParams(), True),
+    ],
+)
+def test_overlay_rule_for_new_processing(
+    hierarchy: Hierarchy, kind: AnalysisKind, params: object, expected: bool
+) -> None:
+    """大きさが変わる処理は重ねず、波形が同じ大きさの処理だけを重ねる。"""
+    data = _data(hierarchy, NOISY)
+    assert overlays_input(_spec(data, kind, params)) is expected
+
+
+def test_offset_headline_states_the_baseline(hierarchy: Hierarchy) -> None:
+    """オフセット除去の結論の文は、差し引いた基準値を述べる。"""
+    data = _data(hierarchy, np.full(TIME.shape, 7.0) + NOISY - np.mean(NOISY), "N")
+    result = run_analysis(_spec(data, AnalysisKind.OFFSET, OffsetParams()), data)
+    assert "基準値 7 N" in result.headline
+    assert float(np.mean(result.series[0].values)) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_resample_result_has_its_own_time_axis_and_can_be_cached(hierarchy: Hierarchy) -> None:
+    """リサンプリングの結果は別の長さの時刻を持ち、キャッシュから同じ結果に戻せる。"""
+    data = _data(hierarchy, NOISY, "N")
+    spec = _spec(data, AnalysisKind.RESAMPLE, ResampleParams(rate_hz=50.0))
+    result = run_analysis(spec, data)
+    infos = output_infos(spec, data.channel)
+    series = result.series[0]
+    assert series.time_s.size < TIME.size
+    assert series.channel_name == data.channel.name
+    restored = result_from_frame(spec, data.channel, data.source, result_to_frame(result, infos))
+    assert restored is not None
+    np.testing.assert_array_equal(restored.series[0].time_s, series.time_s)
+    np.testing.assert_array_equal(restored.series[0].values, series.values)
+
+
+def test_filled_samples_get_markers_that_survive_the_cache(hierarchy: Hierarchy) -> None:
+    """補間した点には印を付け、キャッシュから戻しても印が残る（埋めた点を隠さない）。"""
+    values = NOISY.copy()
+    values[10:15] = np.nan
+    data = _data(hierarchy, values)
+    spec = _spec(data, AnalysisKind.FILL_GAPS, FillGapsParams())
+    result = run_analysis(spec, data)
+    series = result.series[0]
+    assert series.marker_times_s is not None
+    np.testing.assert_array_equal(series.marker_times_s, TIME[10:15])
+    assert "欠損 5 個のうち 5 個を補間しました" in result.headline
+    infos = output_infos(spec, data.channel)
+    restored = result_from_frame(spec, data.channel, data.source, result_to_frame(result, infos))
+    assert restored is not None
+    assert restored.series[0].marker_times_s is not None
+    np.testing.assert_array_equal(restored.series[0].marker_times_s, TIME[10:15])
+
+
+def test_statistics_result_has_metrics_chart_and_markers(hierarchy: Hierarchy) -> None:
+    """区間統計は時系列を出さず、指標の表・分布・最大と最小の時刻の印を返す。"""
+    data = _data(hierarchy, NOISY, "N")
+    spec = _spec(data, AnalysisKind.STATISTICS, StatisticsParams())
+    assert output_infos(spec, data.channel) == []
+    result = run_analysis(spec, data)
+    values = _metric_values(result)
+    assert result.series == []
+    assert values["mean"] == pytest.approx(float(np.mean(NOISY)))
+    assert values["std"] == pytest.approx(float(np.std(NOISY, ddof=1)))
+    assert values["rms"] == pytest.approx(float(np.sqrt(np.mean(NOISY**2))))
+    assert values["peak_to_peak"] == pytest.approx(float(np.ptp(NOISY)))
+    assert result.charts[0].title == "値の分布（ヒストグラム）"
+    assert [marker.label for marker in result.time_markers] == ["最大", "最小"]
+    assert "平均" in result.headline
+
+
+def test_two_channel_labels_use_standard_terms(hierarchy: Hierarchy) -> None:
+    """図と指標の用語は標準の用語を使う。"""
+    data = _data(hierarchy, STEP_INPUT, "N")
+    output = _output_channel(hierarchy, STEP_OUTPUT)
+    spec = _two_channel_spec(data, output, AnalysisKind.STEP_RESPONSE, StepResponseParams())
+    result = run_analysis(spec, data, output_data=output)
+    labels = {metric.label for metric in result.metrics}
+    assert {"遅れ時間 Td", "立ち上がり時間 Tr", "時定数 τ", "むだ時間 L", "整定時間 Ts"} <= labels
+    assert {"オーバーシュート", "定常ゲイン"} <= labels

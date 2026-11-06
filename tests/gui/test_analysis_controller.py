@@ -208,7 +208,7 @@ def test_kalman_estimate_is_overlaid_and_extras_are_on_request(
     drawn = window.workspace.panels[0].series[1]
     assert drawn.band_lower is not None
     assert drawn.band_upper is not None
-    assert "推定の不確かさ" in panel.status_label.text()
+    assert "イノベーションの RMS" in panel.status_label.text()
 
     assert window.analysis.show_series(derivative)
     expected = [[accel, estimate], [derivative], [velocity]]  # 入力のすぐ下に並べる
@@ -606,6 +606,21 @@ def test_range_selector_appears_and_drives_recalculation(
     window.close()
 
 
+def test_range_starts_in_the_middle_of_data_that_begins_at_zero(
+    qtbot: QtBot, tmp_path: Path
+) -> None:
+    """時刻 0 から始まるデータでも、欄の仮の値 0〜1 ではなくデータの中央から始める。"""
+    rows = "\n".join(f"{i / 100:.2f},{i / 1000:.3f}" for i in range(1001))
+    path = tmp_path / "from_zero.csv"
+    path.write_text(f"time_s,value\n{rows}\n", encoding="utf-8")
+    window = _window(qtbot)
+    window.open_files([path])
+    _wait_idle(qtbot, window)
+    _start(qtbot, window, AnalysisKind.CROP)
+    assert window.analysis_panel.range_values() == pytest.approx((3.0, 7.0), abs=0.5)
+    window.close()
+
+
 def test_leaving_two_channel_analysis_clears_overlays_and_result(
     qtbot: QtBot, tmp_path: Path, synthetic_dataset: SyntheticDataset
 ) -> None:
@@ -673,4 +688,101 @@ def test_different_clocks_are_refused_with_reason_until_offset_is_given(
     page.offset_edit.set_value(high.clock_offset_s - low.clock_offset_s)
     _run(qtbot, window)
     assert window.result_view.analysis_id == panel.analysis_id
+    window.close()
+
+
+# --- 値の変換・時間の処理・統計 -------------------------------------------------------
+
+
+def test_crop_overlays_selected_section_on_input(
+    qtbot: QtBot, tmp_path: Path, synthetic_dataset: SyntheticDataset
+) -> None:
+    """切り出しは青い帯で区間を選び、結果を生データに重ねる。時刻は元の時間軸のまま。"""
+    window, accel, velocity = _project_with_data(qtbot, tmp_path / "p", synthetic_dataset)
+    panel = window.analysis_panel
+    window.select_channel(accel)
+    _start(qtbot, window, AnalysisKind.CROP)
+    output = output_series_id(panel.analysis_id, "output")
+    assert _layout(window) == [[accel, output], [velocity]]
+    plot_panel = window.workspace.panels[0]
+    selected = plot_panel.region_range()
+    assert selected is not None
+    cut, raw = plot_panel.series[1], plot_panel.series[0]
+    assert cut.time_s.size < raw.time_s.size
+    assert float(cut.time_s[0]) >= selected[0] - 0.01
+    window.close()
+
+
+def test_saved_crop_is_restored_with_shorter_time_axis(
+    qtbot: QtBot, tmp_path: Path, synthetic_dataset: SyntheticDataset
+) -> None:
+    """切り出した結果は、長さが変わっていても開き直すと復元される。"""
+    root = tmp_path / "p"
+    window, accel, _ = _project_with_data(qtbot, root, synthetic_dataset)
+    window.select_channel(accel)
+    _start(qtbot, window, AnalysisKind.CROP)
+    expected = window.workspace.panels[0].series[1]
+    spec_id = window.analysis_panel.analysis_id
+    window.close()
+
+    reopened = _window(qtbot)
+    assert reopened.open_project(root)
+    restored = reopened.workspace.panels[0].series[1]
+    np.testing.assert_array_equal(restored.time_s, expected.time_s)
+    np.testing.assert_array_equal(restored.values, expected.values)
+    assert reopened.edit_analysis(spec_id)
+    assert reopened.analysis_panel.range_values() is not None
+    reopened.close()
+
+
+def test_statistics_show_result_without_new_series(
+    qtbot: QtBot, tmp_path: Path, synthetic_dataset: SyntheticDataset
+) -> None:
+    """区間統計は解析結果の欄に表と分布を出し、時系列は増やさない。"""
+    window, accel, velocity = _project_with_data(qtbot, tmp_path / "p", synthetic_dataset)
+    panel = window.analysis_panel
+    window.select_channel(accel)
+    _start(qtbot, window, AnalysisKind.STATISTICS)
+    data = window.load_channel_data(accel)
+    assert data is not None
+    assert _layout(window) == [[accel], [velocity]]
+    assert window.result_view.analysis_id == panel.analysis_id
+    assert float(_metric_text(window, "平均値")) == pytest.approx(
+        float(np.mean(data.values)), rel=1e-3
+    )
+    assert window.result_view.headline_label.text().startswith("平均")
+    assert window.workspace.panels[0].marker_count() == 2  # 最大と最小の時刻
+    assert window.explorer_analysis_ids() == [panel.analysis_id]
+    window.close()
+
+
+def test_scale_result_goes_below_input_with_its_unit(
+    qtbot: QtBot, tmp_path: Path, synthetic_dataset: SyntheticDataset
+) -> None:
+    """線形変換は大きさが変わるので重ねず、指定した単位で入力のすぐ下に出す。"""
+    window, accel, velocity = _project_with_data(qtbot, tmp_path / "p", synthetic_dataset)
+    panel = window.analysis_panel
+    window.select_channel(accel)
+    panel.scale_page.gain_edit.set_value(1000.0)
+    panel.scale_page.unit_edit.setText("mm/s^2")
+    _start(qtbot, window, AnalysisKind.SCALE)
+    output = output_series_id(panel.analysis_id, "output")
+    assert _layout(window) == [[accel], [output], [velocity]]
+    series = window.workspace.panels[1].series[0]
+    assert series.unit == "mm/s^2"
+    data = window.load_channel_data(accel)
+    assert data is not None
+    np.testing.assert_allclose(series.values, data.values * 1000.0)
+    window.close()
+
+
+def test_fill_gaps_says_when_nothing_is_missing(
+    qtbot: QtBot, tmp_path: Path, synthetic_dataset: SyntheticDataset
+) -> None:
+    """欠損がないデータでは、そのことを結論の文で知らせる。"""
+    window, accel, _ = _project_with_data(qtbot, tmp_path / "p", synthetic_dataset)
+    panel = window.analysis_panel
+    window.select_channel(accel)
+    _start(qtbot, window, AnalysisKind.FILL_GAPS)
+    assert "欠損はありません" in panel.status_label.text()
     window.close()

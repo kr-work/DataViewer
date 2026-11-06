@@ -9,8 +9,8 @@
        新しい実行を始めると、前の実行は中止し、結果が届いても捨てる（世代番号で判別する）。
     3. 結果を縦並べ表示に反映する。表示中の出力はその場で描き直す。初めての結果は、入力と同じ量
        なら入力のパネルに重ね、単位が違う量（微分・積分など）なら入力のすぐ下のパネルに置く
-       （重ねると縦軸が大きい方に合わせられて、元の線が読めなくなるため）。追加の出力（取り除いた
-       成分・イノベーション・√R）は、左の一覧のチェックで必要なものだけを表示する。
+       （重ねると縦軸が大きい方に合わせられて、元の線が読めなくなるため）。追加の出力（除去成分・
+       イノベーション・√R）は、左の一覧のチェックで必要なものだけを表示する。
        2 チャンネルの解析は時系列を出力しないので、入力と出力のチャンネルを表示し、
        指標とグラフを ``result_ready`` で知らせ、時刻の印を縦並べ表示に引く。
     4. 計算できた処理は自動で保存する（利用者が保存を意識しなくてよいように）。
@@ -41,7 +41,7 @@ from experiment_workbench.analysis import (
     series_from_channel,
 )
 from experiment_workbench.model import (
-    TWO_CHANNEL_ANALYSIS_KINDS,
+    METRIC_ANALYSIS_KINDS,
     AnalysisOutputInfo,
     AnalysisResult,
     AnalysisSpec,
@@ -355,7 +355,7 @@ class AnalysisController(QObject):
         is_new = all(saved.id != spec.id for saved in self._analyses)
         self._display(spec, result, is_new=is_new)
         current = self.panel.is_editing and self.panel.analysis_id == spec.id
-        if spec.kind not in TWO_CHANNEL_ANALYSIS_KINDS:
+        if spec.kind not in METRIC_ANALYSIS_KINDS:
             if current:
                 self.panel.show_summary([result.headline, *result.summary])
         elif current:
@@ -416,7 +416,7 @@ class AnalysisController(QObject):
             result: 解析の結果。
             is_new: 新しい処理の最初の結果なら True。
         """
-        if spec.kind in TWO_CHANNEL_ANALYSIS_KINDS:
+        if spec.kind in METRIC_ANALYSIS_KINDS:
             self._show_two_channels(spec)
             return
         for series in result.series:
@@ -566,11 +566,11 @@ class AnalysisController(QObject):
             spec: 実行する解析の条件。
             data: 入力チャンネルのデータ。
         """
-        alignment = spec.alignment
-        if alignment is None or alignment.start_s is None or alignment.end_s is None:
-            return
-        domain = time_domain_key(data.source)
-        self.workspace.show_range_selector(domain, alignment.start_s, alignment.end_s)
+        for params in (spec.alignment, spec.crop, spec.statistics, spec.offset):
+            if params is not None and params.start_s is not None and params.end_s is not None:
+                domain = time_domain_key(data.source)
+                self.workspace.show_range_selector(domain, params.start_s, params.end_s)
+                return
 
     # --- 保存・削除 ----------------------------------------------------------
 

@@ -51,6 +51,13 @@ MIN_BIN_SAMPLES = 3
 RATE_SCALE_PERCENTILE = 95.0
 """入力の変化の速さの基準にするパーセンタイル（HysteresisParams 参照）。"""
 
+DIRECTION_FLIP_LIMIT = 0.05
+"""入力の変化の向きが反転するサンプルの割合の上限（これを超えたら判定が乱れているとみなす）。
+
+入力が往復するデータでも、向きが反転するのは折り返しの数回だけなので、割合はほぼ 0 になる。
+白色雑音が支配的なら、反転の割合は約 0.5 になる。
+"""
+
 SMITH_LOW_LEVEL = 1.0 - math.exp(-1.0 / 3.0)
 """2 点法の低い方の値（約 28.3%）。一次遅れ＋むだ時間の応答は、時刻 L + τ/3 でこの値になる。"""
 
@@ -553,6 +560,8 @@ class HysteresisAnalyzer:
         threshold = params.min_rate_fraction * scale
         increasing = rate > threshold
         decreasing = rate < -threshold
+        flips = int(np.count_nonzero(np.diff(np.sign(rate)) != 0))
+        unstable = flips > DIRECTION_FLIP_LIMIT * max(rate.size - 1, 1)
 
         slope, intercept = (float(value) for value in np.polyfit(u, y, 1))
         residual_sum = float(np.sum((y - (slope * u + intercept)) ** 2))
@@ -590,7 +599,13 @@ class HysteresisAnalyzer:
             decreasing_branch=decreasing_branch,
             increasing_mask=np.asarray(increasing, dtype=np.bool_),
             decreasing_mask=np.asarray(decreasing, dtype=np.bool_),
+            direction_unstable=unstable,
         )
+        if unstable:
+            result.notes.append(
+                "入力の雑音で、変化方向（増加・減少）の判定が乱れています。ヒステリシスが"
+                "過小評価されている可能性があります。変化方向の判定に平滑化を使ってください"
+            )
         both = np.isfinite(increasing_branch) & np.isfinite(decreasing_branch)
         if both.any():
             difference = increasing_branch[both] - decreasing_branch[both]

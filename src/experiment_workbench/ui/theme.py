@@ -100,7 +100,7 @@ QSplitter::handle {{ background: {BACKGROUND}; }}
 
 
 RAW_BEHIND_RESULT = "#a8b0bb"
-"""処理の結果を重ねたときの元データの線の色（処理の前後の違いが見えるよう、後ろに退かせる）。"""
+"""処理の結果を重ねたときの生データの線の色（処理の前後の違いが見えるよう、後ろに退かせる）。"""
 
 
 def series_color(index: int) -> str:

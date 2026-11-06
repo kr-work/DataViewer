@@ -44,6 +44,7 @@ from pydantic import ValidationError
 
 from experiment_workbench.model import (
     DATASET_TIME_COLUMN,
+    DEFAULT_MAX_GAP_FACTOR,
     Channel,
     ChannelImportSpec,
     ColumnPreview,
@@ -72,12 +73,6 @@ from experiment_workbench.validation import FloatArray
 
 PREVIEW_ROWS = 20
 """プレビューに表示する先頭の行数。"""
-
-MISSING_SEGMENT_FACTOR = 1.5
-"""時刻の間隔が、間隔の中央値のこの倍数を超えたら「欠損区間の可能性」として警告する。
-
-1 サンプル欠ければ間隔は 2 倍になるため確実に検出でき、時刻のジッタ（数 % 程度）では警告しない値。
-"""
 
 DEFAULT_GROUP_NAME = "データ"
 """ファイルを開くだけのときの登録先（実験・セッション・試技）の名前。画面の一覧には出さない。"""
@@ -1139,14 +1134,14 @@ def _check_time(
     positive = steps[steps > 0]
     if positive.size:
         median = float(np.median(positive))
-        gaps = steps > MISSING_SEGMENT_FACTOR * median
+        gaps = steps > DEFAULT_MAX_GAP_FACTOR * median
         if gaps.any():
             row = int(row_numbers[int(np.argmax(gaps)) + 1])
             issues.append(
                 DataIssue(
                     kind=DataIssueKind.MISSING_SEGMENT,
                     description=f"時刻の間隔が中央値 {median:.6g} s の "
-                    f"{MISSING_SEGMENT_FACTOR} 倍を超える箇所が {int(gaps.sum())} か所あります"
+                    f"{DEFAULT_MAX_GAP_FACTOR} 倍を超える箇所が {int(gaps.sum())} か所あります"
                     f"（最大 {float(steps.max()):.6g} s、最初は{_row_label(row)}）。"
                     "欠損区間の可能性があります",
                     column=column,

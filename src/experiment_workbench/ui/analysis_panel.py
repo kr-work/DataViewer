@@ -22,6 +22,7 @@ from uuid import UUID, uuid4
 
 from pydantic import ValidationError
 from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QResizeEvent
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -29,6 +30,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QProgressBar,
@@ -47,12 +49,15 @@ from experiment_workbench.analysis import (
     default_initial_state,
     default_kalman_settings,
     default_omega,
+    display_channel_name,
     estimate_noise_std,
     estimate_sampling_rate,
     round_significant,
 )
 from experiment_workbench.model import (
+    RANGE_ANALYSIS_KINDS,
     TWO_CHANNEL_ANALYSIS_KINDS,
+    AbsoluteParams,
     AdaptiveNoiseMethod,
     AdaptiveNoiseParams,
     AlignmentGrid,
@@ -62,10 +67,13 @@ from experiment_workbench.model import (
     ButterworthKind,
     ButterworthParams,
     ChannelData,
+    CropParams,
     CrossCorrelationParams,
     DerivativeMethod,
     DerivativeParams,
     DetrendMode,
+    DetrendParams,
+    FillGapsParams,
     FilterPadType,
     HysteresisParams,
     IntegralParams,
@@ -77,10 +85,17 @@ from experiment_workbench.model import (
     KinematicSystemParams,
     LinearSystemParams,
     MovingAverageParams,
+    NormalizeMode,
+    NormalizeParams,
+    OffsetMode,
+    OffsetParams,
     OnsetThresholdMode,
     PolynomialObservationParams,
+    ResampleParams,
     SavitzkyGolayMode,
     SavitzkyGolayParams,
+    ScaleParams,
+    StatisticsParams,
     StepDirection,
     StepResponseParams,
 )
@@ -95,13 +110,22 @@ BUSY_DISPLAY_DELAY_MS = 300
 KIND_LABELS = {
     AnalysisKind.BUTTERWORTH: "バターワースフィルタ",
     AnalysisKind.MOVING_AVERAGE: "移動平均",
-    AnalysisKind.SAVITZKY_GOLAY: "Savitzky-Golay 平滑化",
-    AnalysisKind.DERIVATIVE: "微分",
-    AnalysisKind.INTEGRAL: "積分",
+    AnalysisKind.SAVITZKY_GOLAY: "Savitzky-Golay フィルタ",
+    AnalysisKind.DERIVATIVE: "数値微分",
+    AnalysisKind.INTEGRAL: "数値積分",
     AnalysisKind.KALMAN: "カルマンフィルタ",
-    AnalysisKind.STEP_RESPONSE: "ステップ応答（遅れ・時定数）",
-    AnalysisKind.HYSTERESIS: "ヒステリシス・入出力特性",
-    AnalysisKind.CROSS_CORRELATION: "相互相関（遅れ）",
+    AnalysisKind.STEP_RESPONSE: "ステップ応答",
+    AnalysisKind.HYSTERESIS: "ヒステリシス特性",
+    AnalysisKind.CROSS_CORRELATION: "相互相関",
+    AnalysisKind.OFFSET: "オフセット除去",
+    AnalysisKind.SCALE: "線形変換（倍率・単位換算）",
+    AnalysisKind.DETREND: "トレンド除去",
+    AnalysisKind.ABSOLUTE: "絶対値",
+    AnalysisKind.NORMALIZE: "正規化",
+    AnalysisKind.CROP: "区間の切り出し",
+    AnalysisKind.RESAMPLE: "リサンプリング",
+    AnalysisKind.FILL_GAPS: "欠損の補間",
+    AnalysisKind.STATISTICS: "区間統計",
 }
 """解析の種類の表示名。"""
 
@@ -117,162 +141,235 @@ PRESET_AKF = "akf"
 METHOD_GROUPS = (
     (
         "フィルタ",
-        "ノイズなどの不要な変動を取り除きます",
+        "雑音など不要な周波数成分を除去します",
         (
             (
                 "バターワース",
                 AnalysisKind.BUTTERWORTH,
                 PRESET_NONE,
-                "周波数を指定して成分を取り除きます。迷ったらこれ",
+                "周波数特性を指定するフィルタ（LPF・HPF・BPF・BSF）",
             ),
-            (
-                "移動平均",
-                AnalysisKind.MOVING_AVERAGE,
-                PRESET_NONE,
-                "前後のサンプルの平均をとります",
-            ),
+            ("移動平均", AnalysisKind.MOVING_AVERAGE, PRESET_NONE, "前後のサンプルの平均で平滑化"),
             (
                 "Savitzky-Golay",
                 AnalysisKind.SAVITZKY_GOLAY,
                 PRESET_NONE,
-                "ピークの形を保ちながら平滑化します",
+                "局所多項式近似による平滑化。ピークの形が崩れにくい",
+            ),
+        ),
+    ),
+    (
+        "値の変換",
+        "オフセットや大きさ、単位を変換します",
+        (
+            (
+                "オフセット除去",
+                AnalysisKind.OFFSET,
+                PRESET_NONE,
+                "平均値や基準値を差し引く（ゼロ点補正）",
+            ),
+            ("倍率・単位換算", AnalysisKind.SCALE, PRESET_NONE, "y = a x + b で線形変換する"),
+            (
+                "トレンド除去",
+                AnalysisKind.DETREND,
+                PRESET_NONE,
+                "多項式で近似した緩やかな変動を除去",
+            ),
+            ("絶対値", AnalysisKind.ABSOLUTE, PRESET_NONE, "値の絶対値をとる"),
+            (
+                "正規化",
+                AnalysisKind.NORMALIZE,
+                PRESET_NONE,
+                "Z スコア・最小-最大・ピークで無次元化",
             ),
         ),
     ),
     (
         "微分・積分",
-        "変化の速さや、積み上げた量を求めます",
+        "時間微分と時間積分を計算します",
         (
-            ("微分", AnalysisKind.DERIVATIVE, PRESET_NONE, "時間で微分します"),
-            ("積分", AnalysisKind.INTEGRAL, PRESET_NONE, "時間で積分します"),
+            ("微分", AnalysisKind.DERIVATIVE, PRESET_NONE, "中心差分または Savitzky-Golay 微分"),
+            ("積分", AnalysisKind.INTEGRAL, PRESET_NONE, "累積台形則または累積シンプソン則"),
         ),
     ),
     (
         "カルマンフィルタ",
-        "ノイズを除きながら、値と変化の速さを推定します",
+        "雑音を含む観測から状態を推定します",
         (
+            ("KF", AnalysisKind.KALMAN, PRESET_KF, "線形カルマンフィルタ"),
+            ("EKF", AnalysisKind.KALMAN, PRESET_EKF, "拡張カルマンフィルタ（非線形の観測モデル）"),
+            ("AKF", AnalysisKind.KALMAN, PRESET_AKF, "適応カルマンフィルタ（R を逐次推定）"),
+        ),
+    ),
+    (
+        "時間の処理・統計",
+        "区間の切り出しや等間隔化、統計量の計算をします",
+        (
+            ("切り出し", AnalysisKind.CROP, PRESET_NONE, "指定した時間の区間だけを取り出す"),
+            ("リサンプリング", AnalysisKind.RESAMPLE, PRESET_NONE, "等間隔の時刻に補間する"),
             (
-                "KF",
-                AnalysisKind.KALMAN,
-                PRESET_KF,
-                "線形カルマンフィルタ。値とその微分を推定します",
+                "欠損の補間",
+                AnalysisKind.FILL_GAPS,
+                PRESET_NONE,
+                "欠損（NaN）を前後の値から補間する",
             ),
             (
-                "EKF",
-                AnalysisKind.KALMAN,
-                PRESET_EKF,
-                "拡張カルマンフィルタ。非線形な観測に使います",
-            ),
-            (
-                "AKF",
-                AnalysisKind.KALMAN,
-                PRESET_AKF,
-                "適応カルマンフィルタ。観測雑音を逐次推定します",
+                "区間統計",
+                AnalysisKind.STATISTICS,
+                PRESET_NONE,
+                "平均・標準偏差・RMS・最大・最小など",
             ),
         ),
     ),
     (
-        "2 チャンネルの関係",
-        "入力に対して、出力がどう動くかを調べます",
+        "入出力解析",
+        "入力に対する出力の応答を解析します（2 チャンネル）",
         (
             (
                 "ステップ応答",
                 AnalysisKind.STEP_RESPONSE,
                 PRESET_NONE,
-                "入力の変化に対する出力の遅れ・時定数を求めます",
+                "遅れ時間・立ち上がり時間・時定数・整定時間を求める",
             ),
             (
                 "ヒステリシス",
                 AnalysisKind.HYSTERESIS,
                 PRESET_NONE,
-                "増加時と減少時の入出力特性の差を求めます",
+                "増加時と減少時の入出力特性の差を求める",
             ),
-            (
-                "相互相関",
-                AnalysisKind.CROSS_CORRELATION,
-                PRESET_NONE,
-                "2 つのチャンネルの間の時間の遅れを求めます",
-            ),
+            ("相互相関", AnalysisKind.CROSS_CORRELATION, PRESET_NONE, "2 信号の間の遅れを求める"),
         ),
     ),
 )
 """処理の一覧: (見出し, 説明, ((ボタンの名前, 解析の種類, 追加の設定, 説明), ...)) の並び。"""
 
-_REMOVED_HINT = "取り除いた成分は、左の一覧のチェックで見られます。"
+_REMOVED_HINT = "除去成分（生データ − 結果）は、左の一覧のチェックで表示できます。"
 _METHOD_DESCRIPTIONS = {
     AnalysisKind.MOVING_AVERAGE: (
-        "前後のサンプルの平均をとって滑らかにします。窓長を大きくするほど滑らかになりますが、"
+        "窓内のサンプルの算術平均で平滑化します。窓長を大きくすると雑音は減りますが、"
         f"急な変化も鈍ります。{_REMOVED_HINT}"
     ),
     AnalysisKind.SAVITZKY_GOLAY: (
-        "短い区間ごとに多項式を当てはめて滑らかにします。ピークの高さや形が崩れにくい方法です。"
-        f"窓長を大きくするほど滑らかになります。{_REMOVED_HINT}"
+        "窓内に最小二乗法で多項式を当てはめて平滑化します。移動平均よりピークの高さと幅が"
+        f"保たれます。{_REMOVED_HINT}"
     ),
     AnalysisKind.DERIVATIVE: (
-        "値がどれだけ速く変化しているか（傾き）を求めます。ノイズは強調されるので、"
-        "線が荒いときは Savitzky-Golay 微分を選びます。"
+        "数値微分は雑音を強調します。結果が荒いときは Savitzky-Golay 微分を選びます。"
+        "結果の単位は入力の単位/s です。"
     ),
     AnalysisKind.INTEGRAL: (
-        "値を時間で積み上げます（加速度 → 速度 など）。わずかなずれも時間とともに積み重なるので、"
-        "線が傾いていくことがあります。"
+        "入力にオフセットがあると、積分値は時間に比例してドリフトします。"
+        "必要なら先にオフセット除去の結果を確認してください。"
     ),
     AnalysisKind.STEP_RESPONSE: (
-        "入力が急に変わったとき、出力がどれだけ遅れて動き始め、どれくらいで追いつくかを測ります。"
-        "青い帯の両端を動かして、入力の変化が 1 回だけ入る範囲を選びます。"
+        "入力のステップ変化に対する出力の応答指標を求めます。青い帯の両端を動かして、"
+        "入力の変化が 1 回だけ入る範囲を選びます。帯の先頭と末尾の区間の平均を、"
+        "変化前と変化後の定常値とします。"
     ),
     AnalysisKind.HYSTERESIS: (
-        "入力を増やすときと減らすときで、同じ入力でも出力が違うかを調べます。"
-        "入力が行って戻る範囲を選ぶと、行きと帰りの差が分かります。"
+        "入力の変化方向で増加時と減少時に分け、同じ入力の値での出力の差を求めます。"
+        "入力が往復する範囲を選びます。"
     ),
     AnalysisKind.CROSS_CORRELATION: (
-        "2 つの波形を少しずつずらして重ね、最もよく重なるずれを遅れとして求めます。"
-        "連続的に変化している区間に向いています。"
+        "2 信号の相互相関が最大になるラグを遅れとして求めます。連続的に変化する区間に向きます。"
+        "等間隔の時刻が必要です（周波数の違う 2 ファイルでは「等間隔の時刻」に対応付けます）。"
+    ),
+    AnalysisKind.OFFSET: (
+        "全区間または選んだ区間の平均値、あるいは指定した値を差し引きます。"
+        "無負荷の区間を選ぶと、ゼロ点補正になります。"
+    ),
+    AnalysisKind.SCALE: (
+        "y = a x + b で変換します（校正係数の適用や単位換算）。"
+        "変換後の単位を空欄にすると、単位なしで表示します。"
+    ),
+    AnalysisKind.DETREND: (
+        f"最小二乗法で当てはめた多項式を差し引きます。0 次は平均値、1 次は直線です。{_REMOVED_HINT}"
+    ),
+    AnalysisKind.ABSOLUTE: "各サンプルの絶対値をとります。欠損は欠損のまま残します。",
+    AnalysisKind.NORMALIZE: (
+        "大きさの違う信号を比べるために無次元化します。結果に単位はありません。"
+    ),
+    AnalysisKind.CROP: (
+        "青い帯の両端を動かして、取り出す区間を選びます。時刻は元の時間軸のまま保ちます。"
+    ),
+    AnalysisKind.RESAMPLE: (
+        "等間隔の時刻に補間します。外挿はせず、欠損区間はまたぎません。"
+        "周波数を下げるときは、アンチエイリアスフィルタで折り返しを防ぎます。"
+    ),
+    AnalysisKind.FILL_GAPS: (
+        "欠損（NaN）を前後の有効な値から補間します。補間した点には × 印を付けます。"
+        "両端の欠損は外挿になるので補間しません。時刻そのものが飛んでいる区間は"
+        "補間しません（結果の文で知らせます）。"
+    ),
+    AnalysisKind.STATISTICS: (
+        "全区間または選んだ区間の統計量を求めます。欠損は除いて計算し、その数を表示します。"
     ),
 }
-"""処理の説明（何をするか、条件を動かすとどうなるか）。条件で変わるものはページが返す。"""
+"""処理の説明。条件で変わるものはページが返す。"""
 
 _BUTTERWORTH_DESCRIPTIONS = {
     ButterworthKind.LOWPASS: (
-        "カットオフより速い変動を取り除き、ゆっくりした変化を残します。"
-        f"カットオフを下げるほど滑らかになりますが、速い動きも消えます。{_REMOVED_HINT}"
+        "カットオフ周波数より高い周波数成分を除去します。カットオフ周波数を下げると平滑化が強く"
+        f"なり、速い変化も除去されます。{_REMOVED_HINT}"
     ),
     ButterworthKind.HIGHPASS: (
-        "カットオフより遅い変動（ゆっくりしたずれ）を取り除き、速い変動を残します。"
-        f"カットオフを上げるほど、より多くの変動を取り除きます。{_REMOVED_HINT}"
+        "カットオフ周波数より低い周波数成分（ドリフトなど）を除去します。"
+        f"カットオフ周波数を上げると、除去する帯域が広がります。{_REMOVED_HINT}"
     ),
-    ButterworthKind.BANDPASS: (f"カットオフと上限の間の速さの変動だけを残します。{_REMOVED_HINT}"),
+    ButterworthKind.BANDPASS: (
+        f"下側と上側のカットオフ周波数の間の成分だけを通します。{_REMOVED_HINT}"
+    ),
     ButterworthKind.BANDSTOP: (
-        f"カットオフと上限の間の速さの変動だけを取り除きます（電源ノイズなど）。{_REMOVED_HINT}"
+        f"下側と上側のカットオフ周波数の間の成分だけを除去します（電源雑音など）。{_REMOVED_HINT}"
     ),
 }
-"""バターワースフィルタの種類ごとの説明。"""
+"""バターワースフィルタの特性ごとの説明。"""
 
 _KALMAN_DESCRIPTION = (
-    "雑音のある観測から、値とその変化の速さを推定します。"
-    "プロセス雑音 q を大きくすると観測に素早く追従し、観測雑音 σ を大きくすると滑らかになります。"
+    "雑音を含む観測から、値とその時間微分を推定します。プロセス雑音 PSD q を大きくすると観測への"
+    "追従が速くなり、観測雑音の標準偏差 σ を大きくすると推定値が滑らかになります。"
 )
 _EKF_DESCRIPTION = (
-    "観測が推定したい量の非線形な式で表せるとき（電圧から張力を求めるなど）に使います。"
-    "係数で観測の式を指定します。q を大きくすると素早く追従し、σ を大きくすると滑らかになります。"
+    "観測が状態の非線形関数で表せるとき（電圧から張力を推定するなど）に使います。観測多項式の"
+    "係数で観測モデルを指定します。"
 )
-_LINEAR_DESCRIPTION = "状態遷移 F・観測 H・雑音 Q・R を行列で指定して推定します。"
+_LINEAR_DESCRIPTION = "状態遷移行列 F・観測行列 H・雑音共分散 Q, R を直接指定して推定します。"
 _ADAPTIVE_DESCRIPTION = (
-    "推定の途中で、観測雑音の大きさ R も観測から推定します。"
-    "雑音の大きさが時間とともに変わるデータに使います。"
+    "観測雑音共分散 R もイノベーションから逐次推定します（雑音が変動するデータ向け）。"
 )
 
 _KIND_SHORT_NAMES = {
     AnalysisKind.BUTTERWORTH: "バターワース",
     AnalysisKind.MOVING_AVERAGE: "移動平均",
-    AnalysisKind.SAVITZKY_GOLAY: "SG 平滑化",
+    AnalysisKind.SAVITZKY_GOLAY: "SG",
     AnalysisKind.DERIVATIVE: "微分",
     AnalysisKind.INTEGRAL: "積分",
     AnalysisKind.KALMAN: "カルマン",
     AnalysisKind.STEP_RESPONSE: "ステップ応答",
     AnalysisKind.HYSTERESIS: "ヒステリシス",
     AnalysisKind.CROSS_CORRELATION: "相互相関",
+    AnalysisKind.OFFSET: "オフセット除去",
+    AnalysisKind.SCALE: "線形変換",
+    AnalysisKind.DETREND: "トレンド除去",
+    AnalysisKind.ABSOLUTE: "絶対値",
+    AnalysisKind.NORMALIZE: "正規化",
+    AnalysisKind.CROP: "切り出し",
+    AnalysisKind.RESAMPLE: "リサンプリング",
+    AnalysisKind.FILL_GAPS: "欠損補間",
+    AnalysisKind.STATISTICS: "区間統計",
 }
 """解析の名前の既定値に使う短い名前（凡例や一覧で読みやすいように）。"""
+
+_RANGE_CHECK_LABELS = {
+    AnalysisKind.OFFSET: "平均をとる区間を指定（グラフの青い帯をドラッグ）",
+    AnalysisKind.STATISTICS: "集計する区間を指定（グラフの青い帯をドラッグ）",
+}
+"""範囲の指定のチェックの表示（既定は解析範囲）。"""
+
+_DEFAULT_RANGE_CHECK_LABEL = "解析範囲を指定（グラフの青い帯をドラッグ）"
+
+_RANGE_ON_AT_START = (AnalysisKind.STEP_RESPONSE, AnalysisKind.CROP)
+"""処理を始めたときから範囲を指定する処理（範囲がないと計算できない、または意味がない）。"""
 
 _BUTTERWORTH_LABELS = {
     ButterworthKind.LOWPASS: "低域通過（LPF）",
@@ -281,33 +378,33 @@ _BUTTERWORTH_LABELS = {
     ButterworthKind.BANDSTOP: "帯域阻止（BSF）",
 }
 _PADTYPE_LABELS = {
-    FilterPadType.ODD.value: "点対称に折り返す（odd）",
-    FilterPadType.EVEN.value: "線対称に折り返す（even）",
+    FilterPadType.ODD.value: "奇対称に延長（odd）",
+    FilterPadType.EVEN.value: "偶対称に延長（even）",
     FilterPadType.CONSTANT.value: "端の値で延長（constant）",
-    "": "延長しない",
+    "": "延長なし",
 }
 _SAVGOL_MODE_LABELS = {
     SavitzkyGolayMode.INTERP: "端の窓の多項式で評価（interp）",
-    SavitzkyGolayMode.MIRROR: "折り返し（mirror）",
+    SavitzkyGolayMode.MIRROR: "鏡映（mirror）",
     SavitzkyGolayMode.NEAREST: "端の値で延長（nearest）",
     SavitzkyGolayMode.CONSTANT: "0 で延長（constant）",
-    SavitzkyGolayMode.WRAP: "循環（wrap）",
+    SavitzkyGolayMode.WRAP: "周期的に延長（wrap）",
 }
 _MODEL_LABELS = {
-    KalmanModelKind.KINEMATIC: "運動学モデル（値とその微分）",
-    KalmanModelKind.LINEAR: "線形モデル（行列 F・H・Q・R を指定）",
-    KalmanModelKind.POLYNOMIAL_OBSERVATION: "EKF: 運動学モデル + 多項式の観測",
+    KalmanModelKind.KINEMATIC: "運動学モデル（値とその時間微分）",
+    KalmanModelKind.LINEAR: "線形モデル（F・H・Q・R を直接指定）",
+    KalmanModelKind.POLYNOMIAL_OBSERVATION: "EKF: 運動学モデル + 多項式観測",
 }
 _ADAPTIVE_LABELS = {
-    "": "使わない（R は一定）",
-    AdaptiveNoiseMethod.INNOVATION_WINDOW.value: "窓付きイノベーション推定",
+    "": "なし（R は一定）",
+    AdaptiveNoiseMethod.INNOVATION_WINDOW.value: "イノベーション窓推定",
     AdaptiveNoiseMethod.SAGE_HUSA.value: "Sage-Husa 推定",
 }
 _MAX_LINEAR_STATES = 6
 _MAX_POLYNOMIAL_DEGREE = 5
 _METHOD_LABELS = {
     InterpolationMethod.LINEAR.value: "線形補間",
-    InterpolationMethod.PCHIP.value: "PCHIP（形を保つ 3 次補間）",
+    InterpolationMethod.PCHIP.value: "PCHIP 補間（形状保存の 3 次補間）",
 }
 _GRID_LABELS = {
     AlignmentGrid.INPUT.value: "入力の時刻（出力を補間）",
@@ -315,17 +412,17 @@ _GRID_LABELS = {
     AlignmentGrid.UNIFORM.value: "等間隔の時刻（両方を補間）",
 }
 _DIRECTION_LABELS = {
-    StepDirection.AUTO.value: "自動（初期値と最終値から判定）",
+    StepDirection.AUTO.value: "自動（変化前後の定常値から判定）",
     StepDirection.RISING.value: "増加",
     StepDirection.FALLING.value: "減少",
 }
 _ONSET_LABELS = {
-    OnsetThresholdMode.FRACTION.value: "変化量に対する割合",
-    OnsetThresholdMode.ABSOLUTE.value: "入力の単位の大きさ",
+    OnsetThresholdMode.FRACTION.value: "変化量に対する比",
+    OnsetThresholdMode.ABSOLUTE.value: "入力の単位の絶対値",
 }
 _DETREND_LABELS = {
-    DetrendMode.CONSTANT.value: "平均を引く",
-    DetrendMode.LINEAR.value: "直線の傾向を引く",
+    DetrendMode.CONSTANT.value: "平均値除去",
+    DetrendMode.LINEAR.value: "線形トレンド除去",
 }
 _BUTTERWORTH_SHORT_NAMES = {
     ButterworthKind.LOWPASS: "LPF",
@@ -351,6 +448,29 @@ _MIN_CUTOFF_FRACTION = 1.0 / 2000.0
 """カットオフ周波数のスライダーの下限の、サンプリング周波数に対する割合。"""
 _MAX_CUTOFF_FRACTION = 0.49
 """カットオフ周波数のスライダーの上限の、サンプリング周波数に対する割合（ナイキスト未満）。"""
+_HYSTERESIS_CUTOFF_FRACTION = 1.0 / 200.0
+"""向きの判定の平滑化のカットオフ周波数の初期値の、サンプリング周波数に対する割合。
+
+平滑化が強すぎても向き（傾きの符号）は保たれやすいので、弱すぎるより低めにする。
+"""
+_NORMALIZE_LABELS = {
+    NormalizeMode.Z_SCORE.value: "Z スコア（平均 0、標準偏差 1）",
+    NormalizeMode.MIN_MAX.value: "最小-最大正規化（0〜1）",
+    NormalizeMode.PEAK.value: "ピーク正規化（最大の絶対値を 1）",
+}
+_NORMALIZE_SHORT_NAMES = {
+    NormalizeMode.Z_SCORE.value: "Z スコア",
+    NormalizeMode.MIN_MAX.value: "最小-最大",
+    NormalizeMode.PEAK.value: "ピーク正規化",
+}
+_OFFSET_LABELS = {
+    OffsetMode.MEAN.value: "平均値を差し引く",
+    OffsetMode.VALUE.value: "指定した値を差し引く",
+}
+_PSD_TOOLTIP = (
+    "最高階の時間微分を駆動する白色雑音のパワースペクトル密度。"
+    "大きくすると観測への追従が速くなります"
+)
 _NOISE_SLIDER_SPAN = 1000.0
 """カルマンフィルタの雑音のスライダーの幅（現在の値の 1/この値 〜 この値の倍）。"""
 
@@ -405,6 +525,13 @@ class FloatEdit(QLineEdit):
         self.setText(_exact_text(value))
 
 
+_MATRIX_MIN_COLUMN_WIDTH = 64
+"""行列の表の列の幅の下限 [px]（"0.001" や "1e-06" が読める幅）。"""
+
+_MATRIX_MAX_HEIGHT = 220
+"""行列の表の高さの上限 [px]（これを超える行数は表の中でスクロールする）。"""
+
+
 class MatrixEditor(QTableWidget):
     """実数の行列を表で編集する部品（カルマンフィルタの F・H・Q・R・初期状態など）。
 
@@ -412,16 +539,26 @@ class MatrixEditor(QTableWidget):
         label: エラーメッセージに使う行列名。
     """
 
-    def __init__(self, label: str, parent: QWidget | None = None) -> None:
+    def __init__(
+        self, label: str, parent: QWidget | None = None, *, column_prefix: str | None = None
+    ) -> None:
         """行列名を受け取る。
 
         Args:
             label: 行列名（例: "F"）。
             parent: 親ウィジェット。
+            column_prefix: 列の見出しの接頭辞。"c" なら c0, c1, … と 0 から数える（多項式の係数の
+                ように添字に意味がある場合）。None なら Qt の既定の 1, 2, …。
         """
         super().__init__(parent)
         self.label = label
-        self.horizontalHeader().setDefaultSectionSize(90)
+        self._column_prefix = column_prefix
+        # 列を欄の幅に均等に広げる。列の幅が固定だと、狭いパネルで横スクロールバーが最後の行を
+        # 隠してしまう。列が多くて下限を下回るときだけスクロールバーを出す（_fit_height で
+        # その高さを足す）。
+        columns = self.horizontalHeader()
+        columns.setMinimumSectionSize(_MATRIX_MIN_COLUMN_WIDTH)
+        columns.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.verticalHeader().setDefaultSectionSize(24)
 
     def set_values(self, values: list[list[float]]) -> None:
@@ -435,6 +572,8 @@ class MatrixEditor(QTableWidget):
         cols = len(values[0]) if values else 0
         self.setRowCount(rows)
         self.setColumnCount(cols)
+        if self._column_prefix is not None:
+            self.setHorizontalHeaderLabels([f"{self._column_prefix}{col}" for col in range(cols)])
         for row, row_values in enumerate(values):
             for col, value in enumerate(row_values):
                 self.setItem(row, col, QTableWidgetItem(_exact_text(value)))
@@ -488,11 +627,24 @@ class MatrixEditor(QTableWidget):
         ]
         self.set_values(resized)
 
+    def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802 - Qt のメソッドの上書き
+        """幅が変わるとスクロールバーの有無が変わるので、高さを決め直す。
+
+        Args:
+            event: 大きさの変更のイベント。
+        """
+        super().resizeEvent(event)
+        self._fit_height()
+
     def _fit_height(self) -> None:
         """行数に合わせて表の高さを決める（スクロールしなくても全体が見えるように）。"""
-        height = self.horizontalHeader().height() + 2 * self.frameWidth()
+        header = self.horizontalHeader()
+        height = max(header.height(), header.sizeHint().height()) + 2 * self.frameWidth()
         height += sum(self.rowHeight(row) for row in range(self.rowCount()))
-        self.setFixedHeight(min(height + 4, 220))
+        needed_width = self.columnCount() * _MATRIX_MIN_COLUMN_WIDTH
+        if needed_width > self.viewport().width():
+            height += self.horizontalScrollBar().sizeHint().height()
+        self.setFixedHeight(min(height + 4, _MATRIX_MAX_HEIGHT))
 
 
 def _exact_text(value: float) -> str:
@@ -549,10 +701,18 @@ class SliderField(QWidget):
         self.slider.setMinimumWidth(_SLIDER_MIN_WIDTH)
         self.slider.valueChanged.connect(self._on_slider_moved)
         target.setMaximumWidth(84)
-        layout = QHBoxLayout(self)
+        self.note_label = QLabel()
+        self.note_label.setStyleSheet(f"color: {MUTED};")
+        self.note_label.setVisible(False)
+        self._interval_s: float | None = None
+        row = QHBoxLayout()
+        row.addWidget(self.slider, stretch=1)
+        row.addWidget(target)
+        layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self.slider, stretch=1)
-        layout.addWidget(target)
+        layout.setSpacing(0)
+        layout.addLayout(row)
+        layout.addWidget(self.note_label)
         if isinstance(target, FloatEdit):
             target.textChanged.connect(self._on_target_changed)
         else:
@@ -571,8 +731,29 @@ class SliderField(QWidget):
         self._low, self._high = low, high
         self.sync()
 
+    def set_sample_interval(self, interval_s: float | None) -> None:
+        """サンプル間隔を設定する（サンプル数の欄に、時間に換算した値を添えるため）。
+
+        Args:
+            interval_s: サンプル間隔 [s]。分からなければ None。
+        """
+        self._interval_s = interval_s
+        self._update_note()
+
+    def _update_note(self) -> None:
+        """サンプル数を時間に換算した値を表示する。"""
+        value = self._target_value()
+        if self._interval_s is None or value is None:
+            self.note_label.setVisible(False)
+            return
+        duration = value * self._interval_s
+        text = f"{duration * 1000.0:.4g} ms" if duration < 1.0 else f"{duration:.4g} s"
+        self.note_label.setText(f"{text} に相当")
+        self.note_label.setVisible(True)
+
     def sync(self) -> None:
         """スライダーの位置を、数値の欄の値に合わせる（範囲の外なら端に置く）。"""
+        self._update_note()
         value = self._target_value()
         if value is None or value <= 0:
             return
@@ -610,6 +791,7 @@ class SliderField(QWidget):
                 self._target.set_value(round_significant(value, _SLIDER_SIGNIFICANT_DIGITS))
         finally:
             self._dragging = False
+        self._update_note()
         self.value_changed.emit()
 
     def _on_target_changed(self, *args: object) -> None:
@@ -837,30 +1019,41 @@ class ButterworthPage(_ParamsPage):
         super().__init__(parent)
         self.kind_combo = _combo({kind.value: label for kind, label in _BUTTERWORTH_LABELS.items()})
         self.order_spin = _spin(1, 10, 4)
-        self.low_edit = FloatEdit("カットオフ周波数（下限）", 10.0)
-        self.high_edit = FloatEdit("カットオフ周波数（上限）", 20.0)
-        self.zero_phase_check = QCheckBox("ゼロ位相（前後にかけて位相遅れをなくす）")
+        self.low_edit = FloatEdit("カットオフ周波数", 10.0)
+        self.high_edit = FloatEdit("上側カットオフ周波数", 20.0)
+        self.zero_phase_check = QCheckBox("ゼロ位相フィルタ（順方向と逆方向に適用）")
         self.zero_phase_check.setChecked(True)
+        self.zero_phase_check.setToolTip(
+            "位相遅れがなくなります。実効的な次数は 2 倍になり、"
+            "カットオフ周波数での減衰は −3 dB ではなく −6 dB になります"
+        )
         self.padtype_combo = _combo(_PADTYPE_LABELS)
+        self.padtype_combo.setToolTip("ゼロ位相フィルタで、信号の両端の外側をどう延長するか")
         self.low_slider = SliderField(self.low_edit, 0.1, 1000.0)
         self.high_slider = SliderField(self.high_edit, 0.1, 1000.0)
+        self._low_label = QLabel("カットオフ周波数 [Hz]")
+        self._high_label = QLabel("上側カットオフ周波数 [Hz]")
+        self.nyquist_label = QLabel()
+        self.nyquist_label.setStyleSheet(f"color: {MUTED};")
         details = QWidget()
         details_form = _form_layout(details)
         details_form.setContentsMargins(0, 0, 0, 0)
-        details_form.addRow("端点の延長", self.padtype_combo)
+        details_form.addRow("端点処理", self.padtype_combo)
         main = QWidget()
         self._form = _form_layout(main)
         self._form.setContentsMargins(0, 0, 0, 0)
-        self._form.addRow("種類", self.kind_combo)
-        self._form.addRow("カットオフ [Hz]", self.low_slider)
-        self._form.addRow("上限 [Hz]", self.high_slider)
-        self._form.addRow("次数", self.order_spin)
+        self._form.addRow("特性", self.kind_combo)
+        self._form.addRow(self._low_label, self.low_slider)
+        self._form.addRow(self._high_label, self.high_slider)
+        self._form.addRow("", self.nyquist_label)
+        self._form.addRow("フィルタ次数", self.order_spin)
         self._form.addRow("", self.zero_phase_check)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(9, 4, 9, 4)
         layout.addWidget(main)
         layout.addWidget(CollapsibleSection("詳細", details))
         self.kind_combo.currentIndexChanged.connect(self._update_enabled)
+        self.zero_phase_check.toggled.connect(self.padtype_combo.setEnabled)
         self._watch(
             self.kind_combo,
             self.order_spin,
@@ -946,6 +1139,7 @@ class ButterworthPage(_ParamsPage):
         high = sampling_rate_hz * _MAX_CUTOFF_FRACTION
         self.low_slider.set_range(low, high)
         self.high_slider.set_range(low, high)
+        self.nyquist_label.setText(f"ナイキスト周波数 {sampling_rate_hz / 2.0:.5g} Hz")
 
     def short_name(self) -> str:
         """結果の名前に使う短い説明を返す（"LPF 10 Hz" など）。
@@ -963,11 +1157,14 @@ class ButterworthPage(_ParamsPage):
         return f"{_BUTTERWORTH_SHORT_NAMES[kind]} {cutoff} Hz"
 
     def _update_enabled(self) -> None:
-        """帯域通過・帯域阻止のときだけ上限の欄を出す。"""
+        """帯域通過・帯域阻止のときだけ、下側と上側のカットオフ周波数の欄にする。"""
         kind = ButterworthKind(str(self.kind_combo.currentData()))
         band = kind in (ButterworthKind.BANDPASS, ButterworthKind.BANDSTOP)
         self.high_edit.setEnabled(band)
         self._form.setRowVisible(self.high_slider, band)
+        name = "下側カットオフ周波数" if band else "カットオフ周波数"
+        self.low_edit.label = name
+        self._low_label.setText(f"{name} [Hz]")
 
 
 class MovingAveragePage(_ParamsPage):
@@ -981,7 +1178,10 @@ class MovingAveragePage(_ParamsPage):
         """
         super().__init__(parent)
         self.window_spin = _spin(1, 1_000_000, 11)
-        self.centered_check = QCheckBox("中心窓（位相遅れなし。窓長は奇数）")
+        self.centered_check = QCheckBox("中心移動平均（位相遅れなし。窓長は奇数）")
+        self.centered_check.setToolTip(
+            "オフにすると後方移動平均（因果的）になり、(N−1)/2 サンプルの遅れが生じます"
+        )
         self.centered_check.setChecked(True)
         self.window_slider = SliderField(self.window_spin, 1, _MIN_WINDOW_LIMIT, odd=True)
         form = _form_layout(self)
@@ -1011,14 +1211,16 @@ class MovingAveragePage(_ParamsPage):
         self.window_spin.setValue(params.window_samples)
         self.centered_check.setChecked(params.centered)
 
-    def set_data_size(self, samples: int) -> None:
-        """スライダーの範囲を、データの長さに合わせる。
+    def set_data_size(self, samples: int, interval_s: float | None) -> None:
+        """スライダーの範囲と時間への換算を、データに合わせる。
 
         Args:
             samples: データのサンプル数。
+            interval_s: サンプル間隔 [s]。分からなければ None。
         """
         limit = max(_MIN_WINDOW_LIMIT, round(samples * _WINDOW_LIMIT_FRACTION))
         self.window_slider.set_range(1, limit)
+        self.window_slider.set_sample_interval(interval_s)
 
     def short_name(self) -> str:
         """結果の名前に使う短い説明を返す。
@@ -1046,11 +1248,11 @@ class SavitzkyGolayPage(_ParamsPage):
         details = QWidget()
         details_form = _form_layout(details)
         details_form.setContentsMargins(0, 0, 0, 0)
-        details_form.addRow("端点の扱い", self.mode_combo)
+        details_form.addRow("端点処理", self.mode_combo)
         main = QWidget()
         form = _form_layout(main)
         form.setContentsMargins(0, 0, 0, 0)
-        form.addRow("窓長 [サンプル]", self.window_slider)
+        form.addRow("窓長 [サンプル]（奇数）", self.window_slider)
         form.addRow("多項式の次数", self.polyorder_spin)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(9, 4, 9, 4)
@@ -1083,14 +1285,16 @@ class SavitzkyGolayPage(_ParamsPage):
         self.polyorder_spin.setValue(params.polyorder)
         _select(self.mode_combo, params.mode.value)
 
-    def set_data_size(self, samples: int) -> None:
-        """スライダーの範囲を、データの長さに合わせる。
+    def set_data_size(self, samples: int, interval_s: float | None) -> None:
+        """スライダーの範囲と時間への換算を、データに合わせる。
 
         Args:
             samples: データのサンプル数。
+            interval_s: サンプル間隔 [s]。分からなければ None。
         """
         limit = max(_MIN_WINDOW_LIMIT, round(samples * _WINDOW_LIMIT_FRACTION))
         self.window_slider.set_range(3, limit)
+        self.window_slider.set_sample_interval(interval_s)
 
     def short_name(self) -> str:
         """結果の名前に使う短い説明を返す。
@@ -1121,12 +1325,13 @@ class DerivativePage(_ParamsPage):
         self.edge_order_spin = _spin(1, 2, 2)
         self.window_spin = _spin(3, 1_000_001, 21)
         self.polyorder_spin = _spin(1, 10, 3)
-        form = _form_layout(self)
-        form.addRow("方法", self.method_combo)
-        form.addRow("階数", self.order_spin)
-        form.addRow("端点の差分の精度（中心差分）", self.edge_order_spin)
-        form.addRow("窓長 [サンプル]（SG）", self.window_spin)
-        form.addRow("多項式の次数（SG）", self.polyorder_spin)
+        self.edge_order_spin.setToolTip("端点で使う片側差分の精度の次数（1 次または 2 次）")
+        self._form = _form_layout(self)
+        self._form.addRow("計算方法", self.method_combo)
+        self._form.addRow("微分の階数", self.order_spin)
+        self._form.addRow("端点の差分精度 [次]", self.edge_order_spin)
+        self._form.addRow("窓長 [サンプル]（奇数）", self.window_spin)
+        self._form.addRow("多項式の次数", self.polyorder_spin)
         self.method_combo.currentIndexChanged.connect(self._update_enabled)
         self._watch(
             self.method_combo,
@@ -1183,6 +1388,9 @@ class DerivativePage(_ParamsPage):
         self.edge_order_spin.setEnabled(not savgol)
         self.window_spin.setEnabled(savgol)
         self.polyorder_spin.setEnabled(savgol)
+        self._form.setRowVisible(self.edge_order_spin, not savgol)
+        self._form.setRowVisible(self.window_spin, savgol)
+        self._form.setRowVisible(self.polyorder_spin, savgol)
 
 
 class IntegralPage(_ParamsPage):
@@ -1203,7 +1411,7 @@ class IntegralPage(_ParamsPage):
         )
         self.initial_edit = FloatEdit("初期値（積分定数）", 0.0)
         form = _form_layout(self)
-        form.addRow("方法", self.method_combo)
+        form.addRow("積分則", self.method_combo)
         form.addRow("初期値（積分定数）", self.initial_edit)
         self._watch(self.method_combo, self.initial_edit)
 
@@ -1251,10 +1459,13 @@ class AlignmentPage(_ParamsPage):
         super().__init__(parent)
         self._channel_sources: dict[UUID, UUID] = {}
         self.output_combo = QComboBox()
-        self.range_check = QCheckBox("範囲を指定（グラフの青い帯をドラッグ）")
-        self.start_edit = FloatEdit("範囲の開始", 0.0)
-        self.end_edit = FloatEdit("範囲の終了", 1.0)
-        fit_button = QPushButton("表示中の範囲に合わせる")
+        self.range_check = QCheckBox(_DEFAULT_RANGE_CHECK_LABEL)
+        self.start_edit = FloatEdit("開始時刻", 0.0)
+        self.end_edit = FloatEdit("終了時刻", 1.0)
+        # 欄の 0〜1 は欄を埋めるための仮の値で、データとは無関係。選ばれるまでは範囲として扱わない
+        # （時刻 0 から始まるデータと重なるので、値だけでは仮の値と区別できない）。
+        self._range_chosen = False
+        fit_button = QPushButton("表示範囲に合わせる")
         fit_button.clicked.connect(self._on_fit_clicked)
         self.fit_range_button = fit_button
         self.offset_check = QCheckBox("時刻オフセットを指定")
@@ -1265,31 +1476,35 @@ class AlignmentPage(_ParamsPage):
         self.offset_edit.setToolTip("出力チャンネルの時刻に足して、入力の時刻に揃える値 [s]")
         self.method_combo = _combo(_METHOD_LABELS)
         self.grid_combo = _combo(_GRID_LABELS)
-        self.rate_edit = FloatEdit("サンプリング周波数", 1000.0)
+        self.rate_edit = FloatEdit("リサンプリング周波数", 1000.0)
 
         main = QWidget()
         self._form = _form_layout(main)
         self._form.setContentsMargins(0, 0, 0, 0)
         self._form.addRow("出力チャンネル", self.output_combo)
         self._form.addRow(self.range_check)
-        self._form.addRow("開始 [s]", self.start_edit)
-        self._form.addRow("終了 [s]", self.end_edit)
+        self._form.addRow("開始時刻 [s]", self.start_edit)
+        self._form.addRow("終了時刻 [s]", self.end_edit)
         self._form.addRow(self.fit_range_button)
         details = QWidget()
         details_form = _form_layout(details)
         details_form.setContentsMargins(0, 0, 0, 0)
         details_form.addRow(self.offset_check)
         details_form.addRow("時刻オフセット [s]", self.offset_edit)
-        details_form.addRow("補間の方法", self.method_combo)
-        details_form.addRow("対応付ける時刻", self.grid_combo)
-        details_form.addRow("周波数 [Hz]（等間隔）", self.rate_edit)
+        details_form.addRow("補間方法", self.method_combo)
+        details_form.addRow("補間先の時刻", self.grid_combo)
+        details_form.addRow("リサンプリング周波数 [Hz]", self.rate_edit)
         # 同じファイルの列どうしなら触らなくてよい条件なので、畳んでおく。
-        self.details_section = CollapsibleSection("時刻の対応と補間（別のファイルのとき）", details)
+        self.details_section = CollapsibleSection(
+            "時刻の対応付けと補間（別ファイルのとき）", details
+        )
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(main)
         layout.addWidget(self.details_section)
         self.range_check.toggled.connect(self._on_range_toggled)
+        self.start_edit.textEdited.connect(self._on_range_edited)
+        self.end_edit.textEdited.connect(self._on_range_edited)
         self.offset_check.toggled.connect(self._update_enabled)
         self.grid_combo.currentIndexChanged.connect(self._update_enabled)
         self._watch(
@@ -1399,6 +1614,43 @@ class AlignmentPage(_ParamsPage):
         self.range_check.setChecked(ranged)
         self._update_enabled()
 
+    def set_context(self, kind: AnalysisKind) -> None:
+        """解析の種類に合わせて、使う欄だけを出す。
+
+        Args:
+            kind: 解析の種類。
+        """
+        two_channel = kind in TWO_CHANNEL_ANALYSIS_KINDS
+        self._form.setRowVisible(self.output_combo, two_channel)
+        self.details_section.setVisible(two_channel)
+        self._form.setRowVisible(self.range_check, kind is not AnalysisKind.CROP)
+        self.range_check.setText(_RANGE_CHECK_LABELS.get(kind, _DEFAULT_RANGE_CHECK_LABEL))
+
+    def selected_range(self) -> tuple[float | None, float | None]:
+        """指定している範囲を返す。
+
+        Returns:
+            (開始, 終了) [s]。範囲を指定していなければ (None, None)。
+
+        Raises:
+            ValueError: 数値として読めない欄がある場合。
+        """
+        if not self.range_check.isChecked():
+            return None, None
+        return self.start_edit.value(), self.end_edit.value()
+
+    def load_range(self, start_s: float | None, end_s: float | None) -> None:
+        """保存した範囲を表示する。
+
+        Args:
+            start_s: 開始 [s]。
+            end_s: 終了 [s]。
+        """
+        ranged = start_s is not None and end_s is not None
+        if start_s is not None and end_s is not None:
+            self.set_range(start_s, end_s)
+        self.range_check.setChecked(ranged)
+
     def set_range(self, start_s: float, end_s: float) -> None:
         """解析する範囲の欄を更新する（有効数字 7 桁に丸めて見やすくする）。
 
@@ -1408,18 +1660,25 @@ class AlignmentPage(_ParamsPage):
         """
         self.start_edit.set_value(round_significant(start_s, 7))
         self.end_edit.set_value(round_significant(end_s, 7))
+        self._range_chosen = True
 
     def range_values(self) -> tuple[float, float] | None:
         """範囲の欄の値を返す。
 
         Returns:
-            (開始, 終了) [s]。読めない、または開始が終了以降なら None。
+            (開始, 終了) [s]。まだ選ばれていない、読めない、または開始が終了以降なら None。
         """
+        if not self._range_chosen:
+            return None
         try:
             start, end = self.start_edit.value(), self.end_edit.value()
         except ValueError:
             return None
         return (start, end) if start < end else None
+
+    def _on_range_edited(self) -> None:
+        """欄に打ち込まれた値は、選ばれた範囲として扱う。"""
+        self._range_chosen = True
 
     def _on_range_toggled(self, enabled: bool) -> None:
         """範囲の指定のオン・オフを知らせる。
@@ -1455,34 +1714,33 @@ class StepResponsePage(_ParamsPage):
             parent: 親ウィジェット。
         """
         super().__init__(parent)
-        hint = QLabel(
-            "範囲に入力の変化が 1 回だけ入るようにします。範囲の先頭と末尾の区間の平均を、"
-            "変化前の値（初期値）と変化後の値（最終値）にします。"
-        )
-        hint.setWordWrap(True)
         self.direction_combo = _combo(_DIRECTION_LABELS)
         self.onset_mode_combo = _combo(_ONSET_LABELS)
-        self.threshold_edit = FloatEdit("変化の開始のしきい値", 0.1)
-        self.baseline_edit = FloatEdit("初期値の区間", 0.1)
-        self.final_edit = FloatEdit("最終値の区間", 0.1)
-        self.band_edit = FloatEdit("整定の幅", 0.05)
-        self.smoothing_check = QCheckBox("平滑化してから求める")
+        self.threshold_edit = FloatEdit("開始判定のしきい値", 0.1)
+        self.baseline_edit = FloatEdit("初期値の平均区間", 0.1)
+        self.final_edit = FloatEdit("最終値の平均区間", 0.1)
+        self.band_edit = FloatEdit("整定許容幅", 0.05)
+        self.smoothing_check = QCheckBox("解析の前にローパスフィルタをかける")
         self.smoothing_check.setToolTip(
-            "雑音が多いときに、入力と出力にローパスをかけてから求めます"
+            "雑音が多いときに使います。入力と出力の両方にゼロ位相フィルタをかけます"
         )
         self.smoothing_edit = FloatEdit("平滑化のカットオフ周波数", 100.0)
-        form = _form_layout(self)
-        form.addRow(hint)
-        form.addRow("入力の変化の向き", self.direction_combo)
-        form.addRow("変化の開始のしきい値", self.onset_mode_combo)
-        form.addRow("しきい値", self.threshold_edit)
-        form.addRow("初期値の区間（範囲に対する割合）", self.baseline_edit)
-        form.addRow("最終値の区間（範囲に対する割合）", self.final_edit)
-        form.addRow("整定の幅（変化量に対する割合）", self.band_edit)
-        form.addRow(self.smoothing_check)
-        form.addRow("カットオフ [Hz]", self.smoothing_edit)
-        self.smoothing_check.toggled.connect(self.smoothing_edit.setEnabled)
-        self.smoothing_edit.setEnabled(False)
+        self.baseline_edit.setToolTip(
+            "解析範囲の先頭のこの比の区間の平均を、変化前の定常値にします"
+        )
+        self.final_edit.setToolTip("解析範囲の末尾のこの比の区間の平均を、変化後の定常値にします")
+        self.band_edit.setToolTip("出力がこの幅に収まったままになるまでの時間を整定時間とします")
+        self._form = _form_layout(self)
+        self._form.addRow("入力の変化方向", self.direction_combo)
+        self._form.addRow("開始判定のしきい値の基準", self.onset_mode_combo)
+        self._form.addRow("開始判定のしきい値", self.threshold_edit)
+        self._form.addRow("初期値の平均区間（解析範囲に対する比）", self.baseline_edit)
+        self._form.addRow("最終値の平均区間（解析範囲に対する比）", self.final_edit)
+        self._form.addRow("整定許容幅 ±（変化量に対する比）", self.band_edit)
+        self._form.addRow(self.smoothing_check)
+        self._form.addRow("カットオフ周波数 [Hz]", self.smoothing_edit)
+        self.smoothing_check.toggled.connect(self._update_smoothing)
+        self._update_smoothing(self.smoothing_check.isChecked())
         self._watch(
             self.direction_combo,
             self.onset_mode_combo,
@@ -1531,6 +1789,15 @@ class StepResponsePage(_ParamsPage):
         if params.smoothing_cutoff_hz is not None:
             self.smoothing_edit.set_value(params.smoothing_cutoff_hz)
 
+    def _update_smoothing(self, enabled: bool) -> None:
+        """平滑化を使うときだけ、カットオフ周波数の欄を出す。
+
+        Args:
+            enabled: 平滑化を使うなら True。
+        """
+        self.smoothing_edit.setEnabled(enabled)
+        self._form.setRowVisible(self.smoothing_edit, enabled)
+
 
 class HysteresisPage(_ParamsPage):
     """入出力特性とヒステリシスの条件。"""
@@ -1542,26 +1809,28 @@ class HysteresisPage(_ParamsPage):
             parent: 親ウィジェット。
         """
         super().__init__(parent)
-        hint = QLabel(
-            "入力が往復する範囲を選びます。入力の変化の向きで増加時と減少時に分けて、"
-            "同じ入力の値での出力の差を求めます。"
-        )
-        hint.setWordWrap(True)
         self.bins_spin = _spin(2, 10_000, 50)
-        self.rate_edit = FloatEdit("除外する遅い変化の割合", 0.05)
-        self.smoothing_check = QCheckBox("向きの判定に平滑化を使う")
+        self.rate_edit = FloatEdit("静止判定のしきい値", 0.05)
+        self.smoothing_check = QCheckBox("変化方向の判定に平滑化を使う")
         self.smoothing_check.setToolTip(
-            "入力の雑音が多いときに使います。X-Y の値と指標には、平滑化しない値を使います"
+            "増加時と減少時の判定にだけ使います。雑音があると du/dt の符号が乱れて"
+            "ヒステリシスが過小評価されるので、既定でオンにしています。"
+            "X-Y の値と指標には、平滑化しない値を使います"
         )
+        # 微分は雑音を強調するので、わずかな雑音でも平滑化なしでは変化方向の判定が乱れる。
+        # 合成データでは平滑化なしで差が約 1/7 になり、0.5〜20 Hz の平滑化で真値に近づいた。
+        self.smoothing_check.setChecked(True)
         self.smoothing_edit = FloatEdit("平滑化のカットオフ周波数", 10.0)
-        form = _form_layout(self)
-        form.addRow(hint)
-        form.addRow("入力の範囲の区間数", self.bins_spin)
-        form.addRow("除外する遅い変化の割合", self.rate_edit)
-        form.addRow(self.smoothing_check)
-        form.addRow("カットオフ [Hz]", self.smoothing_edit)
-        self.smoothing_check.toggled.connect(self.smoothing_edit.setEnabled)
-        self.smoothing_edit.setEnabled(False)
+        self.rate_edit.setToolTip(
+            "|du/dt| がこの比 × 95 パーセンタイルより小さいサンプルは、静止中として分岐から除きます"
+        )
+        self.bins_spin.setToolTip("入力の範囲を等分する数。区間ごとに分岐の値を求めます")
+        self._form = _form_layout(self)
+        self._form.addRow("入力の分割数", self.bins_spin)
+        self._form.addRow("静止判定のしきい値（変化率の比）", self.rate_edit)
+        self._form.addRow(self.smoothing_check)
+        self._form.addRow("カットオフ周波数 [Hz]", self.smoothing_edit)
+        self.smoothing_check.toggled.connect(self._update_smoothing)
         self._watch(self.bins_spin, self.rate_edit, self.smoothing_check, self.smoothing_edit)
 
     def params(self) -> HysteresisParams:
@@ -1593,6 +1862,24 @@ class HysteresisPage(_ParamsPage):
         if params.smoothing_cutoff_hz is not None:
             self.smoothing_edit.set_value(params.smoothing_cutoff_hz)
 
+    def set_default_cutoff(self, sampling_rate_hz: float) -> None:
+        """平滑化のカットオフ周波数の初期値を、サンプリング周波数に合わせて決める。
+
+        Args:
+            sampling_rate_hz: 入力のサンプリング周波数 [Hz]。
+        """
+        cutoff = sampling_rate_hz * _HYSTERESIS_CUTOFF_FRACTION
+        self.smoothing_edit.set_value(round_significant(cutoff, 3))
+
+    def _update_smoothing(self, enabled: bool) -> None:
+        """平滑化を使うときだけ、カットオフ周波数の欄を出す。
+
+        Args:
+            enabled: 平滑化を使うなら True。
+        """
+        self.smoothing_edit.setEnabled(enabled)
+        self._form.setRowVisible(self.smoothing_edit, enabled)
+
 
 class CrossCorrelationPage(_ParamsPage):
     """相互相関の条件。"""
@@ -1604,21 +1891,15 @@ class CrossCorrelationPage(_ParamsPage):
             parent: 親ウィジェット。
         """
         super().__init__(parent)
-        hint = QLabel(
-            "連続的に変化する信号の遅れを求めます。等間隔の時刻が必要です"
-            "（2 つのファイルの場合は「等間隔の時刻」に対応付けてください）。"
-        )
-        hint.setWordWrap(True)
-        self.min_lag_edit = FloatEdit("遅れを探す範囲の下限", -_DEFAULT_MAX_LAG_S)
-        self.max_lag_edit = FloatEdit("遅れを探す範囲の上限", _DEFAULT_MAX_LAG_S)
+        self.min_lag_edit = FloatEdit("ラグ探索範囲の下限", -_DEFAULT_MAX_LAG_S)
+        self.max_lag_edit = FloatEdit("ラグ探索範囲の上限", _DEFAULT_MAX_LAG_S)
         self.detrend_combo = _combo(_DETREND_LABELS)
-        self.derivative_check = QCheckBox("変化の速さの相関を取る")
+        self.derivative_check = QCheckBox("時間微分の相関をとる")
         self.derivative_check.setToolTip("ステップ状の信号では、相関のピークが鋭くなります")
         form = _form_layout(self)
-        form.addRow(hint)
-        form.addRow("遅れの下限 [s]", self.min_lag_edit)
-        form.addRow("遅れの上限 [s]", self.max_lag_edit)
-        form.addRow("傾向の除去", self.detrend_combo)
+        form.addRow("ラグ探索範囲の下限 [s]", self.min_lag_edit)
+        form.addRow("ラグ探索範囲の上限 [s]", self.max_lag_edit)
+        form.addRow("トレンド除去", self.detrend_combo)
         form.addRow(self.derivative_check)
         self._watch(self.min_lag_edit, self.max_lag_edit, self.detrend_combo, self.derivative_check)
 
@@ -1678,18 +1959,20 @@ class KalmanPage(_ParamsPage):
 
         # 運動学モデル
         self.kinematic_order_spin = _spin(1, 2, 1)
-        self.kinematic_q_edit = FloatEdit("プロセス雑音の強度 q", 1.0)
+        self.kinematic_q_edit = FloatEdit("プロセス雑音 PSD q", 1.0)
         self.kinematic_sigma_edit = FloatEdit("観測雑音の標準偏差 σ", 1.0)
         self.kinematic_q_slider = SliderField(self.kinematic_q_edit, 1e-3, 1e3)
         self.kinematic_sigma_slider = SliderField(self.kinematic_sigma_edit, 1e-3, 1e3)
         kinematic = QWidget()
         kinematic_form = _form_layout(kinematic)
-        self.kinematic_q_slider.setToolTip("プロセス雑音の強度。大きいほど観測に素早く追従します")
-        self.kinematic_sigma_slider.setToolTip("観測雑音の標準偏差。大きいほど滑らかになります")
-        self.kinematic_order_spin.setToolTip("微分の最高階数（1: 等速度モデル、2: 等加速度モデル）")
-        kinematic_form.addRow("プロセス雑音 q", self.kinematic_q_slider)
-        kinematic_form.addRow("観測雑音 σ", self.kinematic_sigma_slider)
-        kinematic_form.addRow("微分の階数", self.kinematic_order_spin)
+        self.kinematic_q_slider.setToolTip(_PSD_TOOLTIP)
+        self.kinematic_sigma_slider.setToolTip("観測雑音の標準偏差。R = σ² です")
+        self.kinematic_order_spin.setToolTip("状態に含める時間微分の階数（1: 等速度、2: 等加速度）")
+        self._kinematic_q_label = QLabel("プロセス雑音 PSD q")
+        self._kinematic_sigma_label = QLabel("観測雑音の標準偏差 σ")
+        kinematic_form.addRow(self._kinematic_q_label, self.kinematic_q_slider)
+        kinematic_form.addRow(self._kinematic_sigma_label, self.kinematic_sigma_slider)
+        kinematic_form.addRow("時間微分の階数", self.kinematic_order_spin)
 
         # 線形モデル（観測は入力チャンネル 1 つなので、H は 1×n、R は 1×1）
         self.linear_dim_spin = _spin(1, _MAX_LINEAR_STATES, 2)
@@ -1700,26 +1983,30 @@ class KalmanPage(_ParamsPage):
         linear = QWidget()
         linear_form = _form_layout(linear)
         linear_form.addRow("状態の次元 n", self.linear_dim_spin)
-        linear_form.addRow("状態遷移 F（n×n）", self.linear_f)
-        linear_form.addRow("観測 H（1×n）", self.linear_h)
-        linear_form.addRow("プロセス雑音 Q（n×n）", self.linear_q)
-        linear_form.addRow("観測雑音 R（1×1）", self.linear_r)
+        linear_form.addRow("状態遷移行列 F（n×n）", self.linear_f)
+        linear_form.addRow("観測行列 H（1×n）", self.linear_h)
+        linear_form.addRow("プロセス雑音共分散 Q（n×n）", self.linear_q)
+        linear_form.addRow("観測雑音共分散 R（1×1）", self.linear_r)
 
         # EKF の組み込みモデル（運動学モデル + 多項式の観測）
         self.polynomial_order_spin = _spin(1, 2, 1)
-        self.polynomial_q_edit = FloatEdit("プロセス雑音の強度 q", 1.0)
+        self.polynomial_q_edit = FloatEdit("プロセス雑音 PSD q", 1.0)
         self.polynomial_sigma_edit = FloatEdit("観測雑音の標準偏差 σ", 1.0)
         self.polynomial_degree_spin = _spin(1, _MAX_POLYNOMIAL_DEGREE, 1)
-        self.polynomial_coefficients = MatrixEditor("係数")
+        self.polynomial_coefficients = MatrixEditor("係数", column_prefix="c")
         self.polynomial_q_slider = SliderField(self.polynomial_q_edit, 1e-3, 1e3)
         self.polynomial_sigma_slider = SliderField(self.polynomial_sigma_edit, 1e-3, 1e3)
         polynomial = QWidget()
         polynomial_form = _form_layout(polynomial)
-        polynomial_form.addRow("プロセス雑音 q", self.polynomial_q_slider)
-        polynomial_form.addRow("観測雑音 σ", self.polynomial_sigma_slider)
-        polynomial_form.addRow("x の微分の階数", self.polynomial_order_spin)
-        polynomial_form.addRow("多項式の次数", self.polynomial_degree_spin)
-        polynomial_form.addRow("係数 c0, c1, …（z = c0 + c1·x + …）", self.polynomial_coefficients)
+        self.polynomial_q_slider.setToolTip(_PSD_TOOLTIP)
+        self._polynomial_sigma_label = QLabel("観測雑音の標準偏差 σ")
+        polynomial_form.addRow("プロセス雑音 PSD q", self.polynomial_q_slider)
+        polynomial_form.addRow(self._polynomial_sigma_label, self.polynomial_sigma_slider)
+        polynomial_form.addRow("時間微分の階数", self.polynomial_order_spin)
+        polynomial_form.addRow("観測多項式の次数", self.polynomial_degree_spin)
+        self.polynomial_coefficients.setToolTip("観測モデル h(x) = c0 + c1 x + c2 x² + … の係数")
+        self.polynomial_coefficients.verticalHeader().hide()  # 1 行だけなので行番号は要らない
+        polynomial_form.addRow("観測多項式の係数", self.polynomial_coefficients)
 
         self.model_stack = _PageStack()
         self.model_stack.add_page(kinematic)
@@ -1739,8 +2026,8 @@ class KalmanPage(_ParamsPage):
         initial_group = QWidget()
         initial_form = _form_layout(initial_group)
         initial_form.setContentsMargins(0, 0, 0, 0)
-        initial_form.addRow("x0（1×n）", self.x0_editor)
-        initial_form.addRow("P0（n×n）", self.p0_editor)
+        initial_form.addRow("初期状態 x₀（1×n）", self.x0_editor)
+        initial_form.addRow("初期誤差共分散 P₀（n×n）", self.p0_editor)
         initial_form.addRow("", defaults_button)
 
         # 適応推定
@@ -1751,9 +2038,9 @@ class KalmanPage(_ParamsPage):
         adaptive_group = QWidget()
         adaptive_form = _form_layout(adaptive_group)
         adaptive_form.setContentsMargins(0, 0, 0, 0)
-        adaptive_form.addRow("方法", self.adaptive_combo)
-        adaptive_form.addRow("窓長 N（窓付き）", self.window_spin)
-        adaptive_form.addRow("忘却係数 b（Sage-Husa）", self.forgetting_edit)
+        adaptive_form.addRow("推定方法", self.adaptive_combo)
+        adaptive_form.addRow("窓長 N [サンプル]", self.window_spin)
+        adaptive_form.addRow("忘却係数 b", self.forgetting_edit)
         adaptive_form.addRow("R の固有値の下限", self.min_variance_edit)
 
         model_form = QFormLayout()
@@ -1763,12 +2050,15 @@ class KalmanPage(_ParamsPage):
         layout.addLayout(model_form)
         layout.addWidget(self.model_stack)
         # まず調整するのはモデルの条件なので、それ以外は畳んでおく。
-        self.adaptive_section = CollapsibleSection("適応推定（R の逐次推定）", adaptive_group)
-        layout.addWidget(CollapsibleSection("初期状態 x0・P0", initial_group))
+        self.adaptive_section = CollapsibleSection(
+            "適応推定（観測雑音共分散 R の逐次推定）", adaptive_group
+        )
+        layout.addWidget(CollapsibleSection("初期値（x₀・P₀）", initial_group))
         layout.addWidget(self.adaptive_section)
 
         self.model_combo.currentIndexChanged.connect(self._on_structure_changed)
         self.kinematic_order_spin.valueChanged.connect(self._on_structure_changed)
+        self.kinematic_order_spin.valueChanged.connect(self._update_units)
         self.linear_dim_spin.valueChanged.connect(self._on_structure_changed)
         self.polynomial_order_spin.valueChanged.connect(self._on_structure_changed)
         self.polynomial_degree_spin.valueChanged.connect(self._on_degree_changed)
@@ -1799,8 +2089,10 @@ class KalmanPage(_ParamsPage):
             self.forgetting_edit,
             self.min_variance_edit,
         )
+        self._unit: str | None = None
         self._reset_matrices()
         self._update_enabled()
+        self._update_units()
         self.model_stack.show_page(kinematic)
 
     # --- 値の取り出しと表示 --------------------------------------------------
@@ -1930,6 +2222,35 @@ class KalmanPage(_ParamsPage):
             self.min_variance_edit.set_value(adaptive.min_variance)
         self._update_enabled()
 
+    def set_input_unit(self, unit: str | None) -> None:
+        """入力チャンネルの単位を、雑音の項目名に反映する。
+
+        Args:
+            unit: 入力チャンネルの単位。分からなければ None。
+        """
+        self._unit = unit
+        self._update_units()
+
+    def _update_units(self, *args: object) -> None:
+        """雑音の項目名の単位を更新する。
+
+        最高階の微分 x⁽ᵈ⁾ を駆動する白色雑音のパワースペクトル密度 q の単位は
+        (x の単位)²/s^(2d+1)。Q₀₀ = q Δt^(2d+1)/((2d+1)(d!)²) が (x の単位)² になるため。
+
+        Args:
+            *args: シグナルの引数（使わない）。
+        """
+        if self._unit is None:
+            self._kinematic_q_label.setText("プロセス雑音 PSD q")
+            self._kinematic_sigma_label.setText("観測雑音の標準偏差 σ")
+            self._polynomial_sigma_label.setText("観測雑音の標準偏差 σ")
+            return
+        base = f"({self._unit})" if any(mark in self._unit for mark in "/*^· ") else self._unit
+        power = 2 * self.kinematic_order_spin.value() + 1
+        self._kinematic_q_label.setText(f"プロセス雑音 PSD q [{base}²/s^{power}]")
+        self._kinematic_sigma_label.setText(f"観測雑音の標準偏差 σ [{self._unit}]")
+        self._polynomial_sigma_label.setText(f"観測雑音の標準偏差 σ [{self._unit}]")
+
     def apply_preset(self, preset: str) -> None:
         """処理の一覧のボタンに合わせて、モデルと適応推定を選ぶ。
 
@@ -2052,6 +2373,377 @@ class KalmanPage(_ParamsPage):
     def _on_defaults_clicked(self) -> None:
         """「データから初期値を作る」が押されたことを知らせる。"""
         self.defaults_requested.emit()
+
+
+class OffsetPage(_ParamsPage):
+    """オフセット除去の条件。"""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        """部品を組み立てる。
+
+        Args:
+            parent: 親ウィジェット。
+        """
+        super().__init__(parent)
+        self.mode_combo = _combo(_OFFSET_LABELS)
+        self.value_edit = FloatEdit("基準値", 0.0)
+        self._form = _form_layout(self)
+        self._form.addRow("基準値の決め方", self.mode_combo)
+        self._form.addRow("基準値", self.value_edit)
+        self.mode_combo.currentIndexChanged.connect(self._update_enabled)
+        self._watch(self.mode_combo, self.value_edit)
+        self._update_enabled()
+
+    def mode(self) -> OffsetMode:
+        """基準値の決め方を返す。
+
+        Returns:
+            基準値の決め方。
+        """
+        return OffsetMode(str(self.mode_combo.currentData()))
+
+    def params(self, start_s: float | None, end_s: float | None) -> OffsetParams:
+        """入力された条件を返す。
+
+        Args:
+            start_s: 平均をとる区間の開始 [s]。
+            end_s: 平均をとる区間の終了 [s]。
+
+        Returns:
+            オフセット除去の条件。
+
+        Raises:
+            ValueError: 数値として読めない欄がある場合。
+        """
+        return OffsetParams(
+            mode=self.mode(), value=self.value_edit.value(), start_s=start_s, end_s=end_s
+        )
+
+    def load(self, params: OffsetParams) -> None:
+        """条件を表示する。
+
+        Args:
+            params: オフセット除去の条件。
+        """
+        _select(self.mode_combo, params.mode.value)
+        self.value_edit.set_value(params.value)
+
+    def _update_enabled(self) -> None:
+        """指定した値を差し引くときだけ、基準値の欄を出す。"""
+        self._form.setRowVisible(self.value_edit, self.mode() is OffsetMode.VALUE)
+
+
+class ScalePage(_ParamsPage):
+    """線形変換の条件。"""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        """部品を組み立てる。
+
+        Args:
+            parent: 親ウィジェット。
+        """
+        super().__init__(parent)
+        self.gain_edit = FloatEdit("倍率 a", 1.0)
+        self.offset_edit = FloatEdit("切片 b", 0.0)
+        self.unit_edit = QLineEdit()
+        self.unit_edit.setPlaceholderText("例: N")
+        form = _form_layout(self)
+        form.addRow("倍率 a", self.gain_edit)
+        form.addRow("切片 b", self.offset_edit)
+        form.addRow("変換後の単位", self.unit_edit)
+        self._watch(self.gain_edit, self.offset_edit, self.unit_edit)
+
+    def params(self) -> ScaleParams:
+        """入力された条件を返す。
+
+        Returns:
+            線形変換の条件。
+
+        Raises:
+            ValueError: 数値として読めない欄がある場合。
+            pydantic.ValidationError: 倍率が 0 の場合。
+        """
+        return ScaleParams(
+            gain=self.gain_edit.value(),
+            offset=self.offset_edit.value(),
+            unit=self.unit_edit.text().strip() or None,
+        )
+
+    def load(self, params: ScaleParams) -> None:
+        """条件を表示する。
+
+        Args:
+            params: 線形変換の条件。
+        """
+        self.gain_edit.set_value(params.gain)
+        self.offset_edit.set_value(params.offset)
+        self.unit_edit.setText(params.unit or "")
+
+    def short_name(self) -> str:
+        """結果の名前に使う短い説明を返す。
+
+        Returns:
+            短い説明。読めない値があれば空。
+        """
+        try:
+            return f"× {self.gain_edit.value():.4g}"
+        except ValueError:
+            return ""
+
+
+class DetrendPage(_ParamsPage):
+    """トレンド除去の条件。"""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        """部品を組み立てる。
+
+        Args:
+            parent: 親ウィジェット。
+        """
+        super().__init__(parent)
+        self.order_spin = _spin(0, 10, 1)
+        self.order_spin.setToolTip("0 次: 平均値、1 次: 直線、2 次以上: 曲線のトレンド")
+        form = _form_layout(self)
+        form.addRow("多項式の次数", self.order_spin)
+        self._watch(self.order_spin)
+
+    def params(self) -> DetrendParams:
+        """入力された条件を返す。
+
+        Returns:
+            トレンド除去の条件。
+        """
+        return DetrendParams(order=self.order_spin.value())
+
+    def load(self, params: DetrendParams) -> None:
+        """条件を表示する。
+
+        Args:
+            params: トレンド除去の条件。
+        """
+        self.order_spin.setValue(params.order)
+
+    def short_name(self) -> str:
+        """結果の名前に使う短い説明を返す。
+
+        Returns:
+            短い説明。
+        """
+        return f"トレンド除去 {self.order_spin.value()} 次"
+
+
+class NormalizePage(_ParamsPage):
+    """正規化の条件。"""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        """部品を組み立てる。
+
+        Args:
+            parent: 親ウィジェット。
+        """
+        super().__init__(parent)
+        self.mode_combo = _combo(_NORMALIZE_LABELS)
+        form = _form_layout(self)
+        form.addRow("正規化の方法", self.mode_combo)
+        self._watch(self.mode_combo)
+
+    def params(self) -> NormalizeParams:
+        """入力された条件を返す。
+
+        Returns:
+            正規化の条件。
+        """
+        return NormalizeParams(mode=NormalizeMode(str(self.mode_combo.currentData())))
+
+    def load(self, params: NormalizeParams) -> None:
+        """条件を表示する。
+
+        Args:
+            params: 正規化の条件。
+        """
+        _select(self.mode_combo, params.mode.value)
+
+    def short_name(self) -> str:
+        """結果の名前に使う短い説明を返す。
+
+        Returns:
+            短い説明。
+        """
+        return _NORMALIZE_SHORT_NAMES[str(self.mode_combo.currentData())]
+
+
+class EmptyPage(_ParamsPage):
+    """条件のない処理のページ（絶対値・切り出しなど。切り出しの範囲は解析範囲の欄で指定する）。"""
+
+
+class ResamplePage(_ParamsPage):
+    """リサンプリングの条件。"""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        """部品を組み立てる。
+
+        Args:
+            parent: 親ウィジェット。
+        """
+        super().__init__(parent)
+        self.rate_edit = FloatEdit("サンプリング周波数", 100.0)
+        self.method_combo = _combo(_METHOD_LABELS)
+        self.anti_alias_check = QCheckBox("アンチエイリアスフィルタをかける")
+        self.anti_alias_check.setChecked(True)
+        self.anti_alias_check.setToolTip(
+            "周波数を下げるとき、変換後のナイキスト周波数より高い成分が低い周波数に折り返すのを"
+            "防ぎます（8 次のゼロ位相ローパスフィルタ。カットオフは変換後の周波数の 0.4 倍）"
+        )
+        self.gap_edit = FloatEdit("欠損とみなす間隔の倍率", 1.5)
+        self.gap_edit.setToolTip("時刻の間隔が中央値のこの倍数を超える区間は、またいで補間しません")
+        form = _form_layout(self)
+        form.addRow("サンプリング周波数 [Hz]", self.rate_edit)
+        form.addRow("補間方法", self.method_combo)
+        form.addRow("", self.anti_alias_check)
+        form.addRow("欠損とみなす間隔の倍率", self.gap_edit)
+        self._watch(self.rate_edit, self.method_combo, self.anti_alias_check, self.gap_edit)
+
+    def params(self) -> ResampleParams:
+        """入力された条件を返す。
+
+        Returns:
+            リサンプリングの条件。
+
+        Raises:
+            ValueError: 数値として読めない欄がある場合。
+            pydantic.ValidationError: 条件が不正な場合。
+        """
+        return ResampleParams(
+            rate_hz=self.rate_edit.value(),
+            method=InterpolationMethod(str(self.method_combo.currentData())),
+            anti_alias=self.anti_alias_check.isChecked(),
+            max_gap_factor=self.gap_edit.value(),
+        )
+
+    def load(self, params: ResampleParams) -> None:
+        """条件を表示する。
+
+        Args:
+            params: リサンプリングの条件。
+        """
+        self.rate_edit.set_value(params.rate_hz)
+        _select(self.method_combo, params.method.value)
+        self.anti_alias_check.setChecked(params.anti_alias)
+        self.gap_edit.set_value(params.max_gap_factor)
+
+    def set_default_rate(self, sampling_rate_hz: float) -> None:
+        """サンプリング周波数の初期値を、入力の半分にする。
+
+        Args:
+            sampling_rate_hz: 入力のサンプリング周波数 [Hz]。
+        """
+        self.rate_edit.set_value(round_significant(sampling_rate_hz / 2.0, 3))
+
+    def short_name(self) -> str:
+        """結果の名前に使う短い説明を返す。
+
+        Returns:
+            短い説明。読めない値があれば空。
+        """
+        try:
+            return f"{self.rate_edit.value():.4g} Hz"
+        except ValueError:
+            return ""
+
+
+class FillGapsPage(_ParamsPage):
+    """欠損の補間の条件。"""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        """部品を組み立てる。
+
+        Args:
+            parent: 親ウィジェット。
+        """
+        super().__init__(parent)
+        self.method_combo = _combo(_METHOD_LABELS)
+        self.limit_check = QCheckBox("補間する欠損の長さに上限を設ける")
+        self.limit_check.setToolTip("長い欠損を補間すると、存在しない波形を作ることになります")
+        self.limit_edit = FloatEdit("補間する欠損の長さの上限", 1.0)
+        self._form = _form_layout(self)
+        self._form.addRow("補間方法", self.method_combo)
+        self._form.addRow(self.limit_check)
+        self._form.addRow("欠損の長さの上限 [s]", self.limit_edit)
+        self.limit_check.toggled.connect(self._update_limit)
+        self._update_limit(self.limit_check.isChecked())
+        self._watch(self.method_combo, self.limit_check, self.limit_edit)
+
+    def params(self) -> FillGapsParams:
+        """入力された条件を返す。
+
+        Returns:
+            欠損の補間の条件。
+
+        Raises:
+            ValueError: 数値として読めない欄がある場合。
+            pydantic.ValidationError: 条件が不正な場合。
+        """
+        limited = self.limit_check.isChecked()
+        return FillGapsParams(
+            method=InterpolationMethod(str(self.method_combo.currentData())),
+            max_gap_s=self.limit_edit.value() if limited else None,
+        )
+
+    def load(self, params: FillGapsParams) -> None:
+        """条件を表示する。
+
+        Args:
+            params: 欠損の補間の条件。
+        """
+        _select(self.method_combo, params.method.value)
+        self.limit_check.setChecked(params.max_gap_s is not None)
+        if params.max_gap_s is not None:
+            self.limit_edit.set_value(params.max_gap_s)
+
+    def _update_limit(self, enabled: bool) -> None:
+        """上限を設けるときだけ、上限の欄を出す。
+
+        Args:
+            enabled: 上限を設けるなら True。
+        """
+        self.limit_edit.setEnabled(enabled)
+        self._form.setRowVisible(self.limit_edit, enabled)
+
+
+class StatisticsPage(_ParamsPage):
+    """区間統計の条件。"""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        """部品を組み立てる。
+
+        Args:
+            parent: 親ウィジェット。
+        """
+        super().__init__(parent)
+        self.bins_spin = _spin(2, 10_000, 50)
+        form = _form_layout(self)
+        form.addRow("ヒストグラムの階級数", self.bins_spin)
+        self._watch(self.bins_spin)
+
+    def params(self, start_s: float | None, end_s: float | None) -> StatisticsParams:
+        """入力された条件を返す。
+
+        Args:
+            start_s: 区間の開始 [s]。
+            end_s: 区間の終了 [s]。
+
+        Returns:
+            区間統計の条件。
+        """
+        return StatisticsParams(start_s=start_s, end_s=end_s, n_bins=self.bins_spin.value())
+
+    def load(self, params: StatisticsParams) -> None:
+        """条件を表示する。
+
+        Args:
+            params: 区間統計の条件。
+        """
+        self.bins_spin.setValue(params.n_bins)
 
 
 # ---------------------------------------------------------------------------
@@ -2185,6 +2877,15 @@ class AnalysisPanel(QWidget):
         self.step_response_page = StepResponsePage()
         self.hysteresis_page = HysteresisPage()
         self.cross_correlation_page = CrossCorrelationPage()
+        self.offset_page = OffsetPage()
+        self.scale_page = ScalePage()
+        self.detrend_page = DetrendPage()
+        self.absolute_page = EmptyPage()
+        self.normalize_page = NormalizePage()
+        self.crop_page = EmptyPage()
+        self.resample_page = ResamplePage()
+        self.fill_gaps_page = FillGapsPage()
+        self.statistics_page = StatisticsPage()
         self.alignment_page = AlignmentPage()
         self.pages: dict[AnalysisKind, _ParamsPage] = {
             AnalysisKind.BUTTERWORTH: self.butterworth_page,
@@ -2196,6 +2897,15 @@ class AnalysisPanel(QWidget):
             AnalysisKind.STEP_RESPONSE: self.step_response_page,
             AnalysisKind.HYSTERESIS: self.hysteresis_page,
             AnalysisKind.CROSS_CORRELATION: self.cross_correlation_page,
+            AnalysisKind.OFFSET: self.offset_page,
+            AnalysisKind.SCALE: self.scale_page,
+            AnalysisKind.DETREND: self.detrend_page,
+            AnalysisKind.ABSOLUTE: self.absolute_page,
+            AnalysisKind.NORMALIZE: self.normalize_page,
+            AnalysisKind.CROP: self.crop_page,
+            AnalysisKind.RESAMPLE: self.resample_page,
+            AnalysisKind.FILL_GAPS: self.fill_gaps_page,
+            AnalysisKind.STATISTICS: self.statistics_page,
         }
         # 解析の種類 → そのページから条件を取り出す関数（AnalysisSpec の同名の項目に入れる）。
         self._params_getters: dict[AnalysisKind, Callable[[], object]] = {
@@ -2208,12 +2918,22 @@ class AnalysisPanel(QWidget):
             AnalysisKind.STEP_RESPONSE: self.step_response_page.params,
             AnalysisKind.HYSTERESIS: self.hysteresis_page.params,
             AnalysisKind.CROSS_CORRELATION: self.cross_correlation_page.params,
+            AnalysisKind.OFFSET: self._offset_params,
+            AnalysisKind.SCALE: self.scale_page.params,
+            AnalysisKind.DETREND: self.detrend_page.params,
+            AnalysisKind.ABSOLUTE: AbsoluteParams,
+            AnalysisKind.NORMALIZE: self.normalize_page.params,
+            AnalysisKind.CROP: self._crop_params,
+            AnalysisKind.RESAMPLE: self.resample_page.params,
+            AnalysisKind.FILL_GAPS: self.fill_gaps_page.params,
+            AnalysisKind.STATISTICS: self._statistics_params,
         }
         self.page_stack = _PageStack()
         for page in self.pages.values():
             self.page_stack.add_page(page)
             page.changed.connect(self._on_changed)
         self.kalman_page.defaults_requested.connect(self._on_kalman_defaults)
+        self.offset_page.mode_combo.currentIndexChanged.connect(self._on_offset_mode_changed)
         self.alignment_page.changed.connect(self._on_changed)
         self.alignment_page.range_toggled.connect(self._emit_range_selection)
         self.alignment_page.fit_range_requested.connect(self.fit_range_requested)
@@ -2285,7 +3005,12 @@ class AnalysisPanel(QWidget):
         self._method_page = QWidget()
         method_layout = QVBoxLayout(self._method_page)
         method_layout.setContentsMargins(0, 0, 0, 0)
-        method_layout.addWidget(self.method_list)
+        method_scroll = QScrollArea()
+        method_scroll.setWidgetResizable(True)
+        method_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        method_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        method_scroll.setWidget(self.method_list)
+        method_layout.addWidget(method_scroll)
         self._screens = _PageStack()
         self._screens.add_page(self._method_page)
         self._screens.add_page(self._editor_page)
@@ -2335,12 +3060,14 @@ class AnalysisPanel(QWidget):
         """解析する範囲の選択を表示する状態かを返す。
 
         Returns:
-            2 チャンネルの解析を調整中で、範囲を指定していれば True。
+            範囲を選べる処理を調整中で、範囲を指定していれば True。
         """
+        if self._kind is AnalysisKind.OFFSET and self.offset_page.mode() is OffsetMode.VALUE:
+            return False  # 指定した値を差し引くときは、平均をとる区間を使わない
         return (
             self._input is not None
             and self._editing
-            and self.kind() in TWO_CHANNEL_ANALYSIS_KINDS
+            and self.kind() in RANGE_ANALYSIS_KINDS
             and self.alignment_page.range_check.isChecked()
         )
 
@@ -2366,6 +3093,8 @@ class AnalysisPanel(QWidget):
                 sampling_rate = self._fit_to_data(data)
                 if sampling_rate is not None:
                     self.butterworth_page.set_default_cutoff(sampling_rate)
+                    self.hysteresis_page.set_default_cutoff(sampling_rate)
+                    self.resample_page.set_default_rate(sampling_rate)
                     self.alignment_page.rate_edit.set_value(round_significant(sampling_rate, 4))
                 if data.time_s.size >= 2:
                     duration = float(data.time_s[-1] - data.time_s[0])
@@ -2407,8 +3136,7 @@ class AnalysisPanel(QWidget):
             self._name_edited = False
             self._kind = kind
             self.kalman_page.apply_preset(preset)
-            # ステップ応答は入力の変化を 1 回含む範囲が必要なので、範囲の指定を始めておく。
-            self.alignment_page.range_check.setChecked(kind is AnalysisKind.STEP_RESPONSE)
+            self.alignment_page.range_check.setChecked(kind in _RANGE_ON_AT_START)
         finally:
             self._loading = False
         self._show_page(kind)
@@ -2431,7 +3159,7 @@ class AnalysisPanel(QWidget):
             self._analysis_id = spec.id
             self._created_at = spec.created_at
             # チャンネル名で始まる名前は自動で付けたものとみなし、条件に合わせて更新する。
-            self._name_edited = not spec.name.startswith(f"{data.channel.name} ")
+            self._name_edited = not spec.name.startswith(f"{display_channel_name(data.channel)} ")
             self.name_edit.setText(spec.name)
             self._kind = spec.kind
             self._show_page(spec.kind)
@@ -2457,6 +3185,7 @@ class AnalysisPanel(QWidget):
                 self.cross_correlation_page.load(spec.cross_correlation)
             if spec.alignment is not None:
                 self.alignment_page.load(spec.alignment, spec.output_channel_id)
+            self._load_transform_params(spec)
         finally:
             self._loading = False
         self._update_input_label()
@@ -2585,6 +3314,62 @@ class AnalysisPanel(QWidget):
 
     # --- 内部処理 ------------------------------------------------------------
 
+    def _load_transform_params(self, spec: AnalysisSpec) -> None:
+        """値の変換と時間の処理の条件を表示する。
+
+        Args:
+            spec: 保存した処理。
+        """
+        if spec.offset is not None:
+            self.offset_page.load(spec.offset)
+            self.alignment_page.load_range(spec.offset.start_s, spec.offset.end_s)
+        if spec.scale is not None:
+            self.scale_page.load(spec.scale)
+        if spec.detrend is not None:
+            self.detrend_page.load(spec.detrend)
+        if spec.normalize is not None:
+            self.normalize_page.load(spec.normalize)
+        if spec.crop is not None:
+            self.alignment_page.load_range(spec.crop.start_s, spec.crop.end_s)
+        if spec.resample is not None:
+            self.resample_page.load(spec.resample)
+        if spec.fill_gaps is not None:
+            self.fill_gaps_page.load(spec.fill_gaps)
+        if spec.statistics is not None:
+            self.statistics_page.load(spec.statistics)
+            self.alignment_page.load_range(spec.statistics.start_s, spec.statistics.end_s)
+
+    def _offset_params(self) -> OffsetParams:
+        """オフセット除去の条件を作る。
+
+        Returns:
+            オフセット除去の条件。
+        """
+        return self.offset_page.params(*self.alignment_page.selected_range())
+
+    def _crop_params(self) -> CropParams:
+        """区間の切り出しの条件を作る。
+
+        Returns:
+            区間の切り出しの条件。
+        """
+        page = self.alignment_page
+        return CropParams(start_s=page.start_edit.value(), end_s=page.end_edit.value())
+
+    def _statistics_params(self) -> StatisticsParams:
+        """区間統計の条件を作る。
+
+        Returns:
+            区間統計の条件。
+        """
+        return self.statistics_page.params(*self.alignment_page.selected_range())
+
+    def _on_offset_mode_changed(self) -> None:
+        """基準値の決め方が変わったら、区間の欄と青い帯の表示を合わせる。"""
+        if self._kind is AnalysisKind.OFFSET:
+            self._show_page(self._kind)
+            self._emit_range_selection()
+
     def _spec_or_error(self) -> AnalysisSpec | None:
         """解析の条件を作る。不正ならエラーを表示して None を返す。
 
@@ -2617,12 +3402,13 @@ class AnalysisPanel(QWidget):
         Returns:
             サンプリング周波数 [Hz]。時刻の逆行や重複で求められなければ None。
         """
-        self.moving_average_page.set_data_size(int(data.time_s.size))
-        self.savitzky_golay_page.set_data_size(int(data.time_s.size))
-        if data.time_s.size < 2:
-            return None
-        sampling_rate = estimate_sampling_rate(data.time_s)
-        if not math.isfinite(sampling_rate) or sampling_rate <= 0:
+        self.kalman_page.set_input_unit(data.channel.unit)
+        sampling_rate = estimate_sampling_rate(data.time_s) if data.time_s.size >= 2 else math.nan
+        known = math.isfinite(sampling_rate) and sampling_rate > 0
+        interval = 1.0 / sampling_rate if known else None
+        self.moving_average_page.set_data_size(int(data.time_s.size), interval)
+        self.savitzky_golay_page.set_data_size(int(data.time_s.size), interval)
+        if not known:
             return None
         self.butterworth_page.set_sampling_rate(sampling_rate)
         return float(sampling_rate)
@@ -2689,7 +3475,11 @@ class AnalysisPanel(QWidget):
             kind: 解析の種類。
         """
         self.page_stack.show_page(self.pages[kind])
-        self.alignment_page.setVisible(kind in TWO_CHANNEL_ANALYSIS_KINDS)
+        uses_range = kind in RANGE_ANALYSIS_KINDS
+        if kind is AnalysisKind.OFFSET:
+            uses_range = self.offset_page.mode() is not OffsetMode.VALUE
+        self.alignment_page.setVisible(uses_range)
+        self.alignment_page.set_context(kind)
 
     def _emit_range_selection(self, *args: object) -> None:
         """解析する範囲の選択を表示するかどうかを知らせる。
@@ -2752,7 +3542,7 @@ class AnalysisPanel(QWidget):
         Returns:
             名前の既定値。
         """
-        channel = self._input.channel.name if self._input is not None else "入力"
+        channel = display_channel_name(self._input.channel) if self._input is not None else "入力"
         short = self.pages[self.kind()].short_name() or _KIND_SHORT_NAMES[self.kind()]
         return f"{channel} {short}"
 
@@ -2767,7 +3557,8 @@ class AnalysisPanel(QWidget):
             self.input_label.setText("左の一覧でチャンネルを選ぶと、処理を追加できます")
         else:
             unit = f" [{self._input.channel.unit}]" if self._input.channel.unit else ""
-            self.input_label.setText(f"対象: {self._input.channel.name}{unit}")
+            name = display_channel_name(self._input.channel)
+            self.input_label.setText(f"対象: {name}{unit}")
 
     def _update_buttons(self) -> None:
         """入力の有無で、処理の一覧を使えるかどうかを切り替える。"""

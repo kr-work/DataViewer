@@ -85,6 +85,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from experiment_workbench.analysis import display_channel_name
 from experiment_workbench.importer import (
     DataImporter,
     ImportBlockedError,
@@ -92,7 +93,7 @@ from experiment_workbench.importer import (
     file_sha256,
 )
 from experiment_workbench.model import (
-    TWO_CHANNEL_ANALYSIS_KINDS,
+    METRIC_ANALYSIS_KINDS,
     AnalysisOutputInfo,
     AnalysisResult,
     AnalysisSpec,
@@ -163,6 +164,14 @@ HELP_TEXT = """<h3>基本の流れ</h3>
 <li>左の一覧でチャンネルをクリック → 右で処理を選ぶ: 結果がグラフに重なります</li>
 <li>右のスライダーや数値を変える: その場で結果が更新されます（保存は自動です）</li>
 </ol>
+<h3>図の読み方</h3>
+<ul>
+<li>パネルの見出しは、チャンネル名と単位です</li>
+<li>処理の結果を重ねると、元の線は「生データ」としてグレーになります</li>
+<li>単位や大きさが変わる結果（微分・積分・正規化など）は、生データのすぐ下のパネルに出ます</li>
+<li>フィルタの除去成分（生データ − 結果）は、左の一覧のチェックで見られます</li>
+<li>入出力解析と区間統計は、下の欄の一文が結論です。①〜④ の番号は、グラフの注記と対応しています</li>
+</ul>
 <h3>グラフの操作</h3>
 <ul>
 <li>左ドラッグ: 選んだ時間の範囲を拡大</li>
@@ -562,6 +571,9 @@ class MainWindow(QMainWindow):
         if importer is None:
             return
         pending = [path for path in files if not importer.has_same_file(path)]
+        if not pending and not self.workspace.displayed_series_ids():
+            # 異常終了などで表示設定が残っていないと、開いても何も見えなくなるので、表示し直す。
+            self._show_imported(importer.store.database.list_entities(Channel))
         for path in files:
             if path not in pending and self._store is not None and len(files) > 1:
                 self.show_message(f"{path.name} はすでに開いています")
@@ -944,7 +956,8 @@ class MainWindow(QMainWindow):
                 source_item = _source_item(source, f"{prefix}{source.name}")
                 self.explorer.addTopLevelItem(source_item)
                 for channel in channels:
-                    choices.append((channel.id, f"{source.name} / {channel.name}", source.id))
+                    label = f"{source.name} / {display_channel_name(channel)}"
+                    choices.append((channel.id, label, source.id))
                     channel_item = _channel_item(channel)
                     source_item.addChild(channel_item)
                     for spec in analyses:
@@ -1059,8 +1072,8 @@ class MainWindow(QMainWindow):
         if data is None:
             return False
         self.analysis_panel.load_spec(spec, data)
-        if spec.kind in TWO_CHANNEL_ANALYSIS_KINDS:
-            # 2 チャンネルの解析は結果を保存しないので、読み込んだら計算して結果を見せる。
+        if spec.kind in METRIC_ANALYSIS_KINDS:
+            # 指標を返す解析は結果を保存しないので、読み込んだら計算して結果を見せる。
             self.analysis_panel.request_run()
         else:
             self._hide_results()
@@ -1358,7 +1371,7 @@ class MainWindow(QMainWindow):
         self.add_series_to_workspace(series_id, panel=panel)
 
     def _on_result_ready(self, spec: AnalysisSpec, result: AnalysisResult) -> None:
-        """2 チャンネルの解析の結果を表示し、解析結果の欄を出す。
+        """指標を返す解析の結果を表示し、解析結果の欄を出す。
 
         最初の結果のときだけ、グラフが見える高さに広げる（その後は利用者の調整を変えない）。
 
@@ -1660,7 +1673,8 @@ def _channel_item(channel: Channel) -> QTreeWidgetItem:
     """
     rate = channel.sample_rate.estimated_hz or channel.sample_rate.nominal_hz
     parts = [channel.unit or "", _format_rate(rate) if rate is not None else ""]
-    item = QTreeWidgetItem([channel.name, "  ".join(part for part in parts if part)])
+    name = display_channel_name(channel)
+    item = QTreeWidgetItem([name, "  ".join(part for part in parts if part)])
     item.setForeground(1, QBrush(QColor(MUTED)))
     item.setData(0, _CHANNEL_ID_ROLE, str(channel.id))
     item.setData(0, _SERIES_ID_ROLE, str(channel.id))
@@ -1677,7 +1691,7 @@ def _analysis_item(
     """処理の行を作る。
 
     処理の行のチェックは主な結果（先頭の出力）の表示を切り替える。それ以外の出力は、
-    行の下に並べる（フィルタの「取り除いた成分」、カルマンフィルタの微分など）。
+    行の下に並べる（フィルタの「除去成分」、カルマンフィルタの微分など）。
 
     Args:
         spec: 処理。
@@ -1687,7 +1701,7 @@ def _analysis_item(
     Returns:
         一覧の項目。
     """
-    item = QTreeWidgetItem([spec.name.removeprefix(f"{channel.name} "), ""])
+    item = QTreeWidgetItem([spec.name.removeprefix(f"{display_channel_name(channel)} "), ""])
     item.setForeground(0, QBrush(QColor(ACCENT)))
     item.setData(0, _ANALYSIS_ID_ROLE, str(spec.id))
     item.setToolTip(0, f"{KIND_LABELS[spec.kind]}。クリックで条件を調整（右クリックで削除）")

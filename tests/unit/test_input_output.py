@@ -570,3 +570,49 @@ def test_smoothing_stabilizes_direction_of_noisy_input() -> None:
     assert smoothed.max_hysteresis == pytest.approx(gain * width, rel=0.1)
     assert raw.max_hysteresis is not None
     assert abs(raw.max_hysteresis - gain * width) > abs(smoothed.max_hysteresis - gain * width)
+
+
+def _noisy_loop(*, noise: float) -> tuple[FloatArray, FloatArray, FloatArray, float]:
+    """入力が往復し、増加時と減少時で出力が一定の差を持つデータを作る。
+
+    入力の変化はゆっくりなので、わずかな雑音でも du/dt では雑音が支配的になる。
+
+    Args:
+        noise: 入力の雑音の標準偏差。
+
+    Returns:
+        (時刻, 入力, 出力, 真のヒステリシス)。
+    """
+    hysteresis = 0.3
+    times = np.arange(30_000, dtype=np.float64) * 1e-3
+    clean = 5.0 + 5.0 * np.sin(2 * np.pi * 0.1 * times)
+    falling = np.gradient(clean, times) < 0.0
+    y = 2.0 * clean + np.where(falling, hysteresis / 2.0, -hysteresis / 2.0)
+    measured = clean + np.random.default_rng(0).normal(0.0, noise, clean.size)
+    return times, measured, y, hysteresis
+
+
+def test_noise_in_direction_is_reported_instead_of_silently_shrinking() -> None:
+    """雑音で向きの判定が乱れたら、小さく見積もっていることを必ず知らせる。"""
+    times, u, y, hysteresis = _noisy_loop(noise=0.02)
+    result = _hysteresis(times, u, y)
+    assert result.direction_unstable
+    assert any("判定が乱れています" in note for note in result.notes)
+    assert result.max_hysteresis is not None
+    assert result.max_hysteresis < 0.5 * hysteresis  # 平滑化なしでは差が打ち消し合う
+
+
+def test_smoothing_recovers_true_hysteresis_from_noisy_input() -> None:
+    """向きの判定を平滑化すると、雑音のある入力でも真のヒステリシスを求められる。"""
+    times, u, y, hysteresis = _noisy_loop(noise=0.02)
+    result = _hysteresis(times, u, y, smoothing_cutoff_hz=5.0)
+    assert not result.direction_unstable
+    assert result.max_hysteresis == pytest.approx(hysteresis, rel=0.2)
+
+
+def test_clean_input_is_not_flagged() -> None:
+    """雑音のない入力は、平滑化しなくても判定が乱れたとはみなさない。"""
+    times, u, y, hysteresis = _noisy_loop(noise=0.0)
+    result = _hysteresis(times, u, y)
+    assert not result.direction_unstable
+    assert result.max_hysteresis == pytest.approx(hysteresis, rel=0.1)

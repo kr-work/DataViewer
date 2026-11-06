@@ -5,6 +5,7 @@ from uuid import uuid4
 import numpy as np
 import pyqtgraph as pg
 import pytest
+from PySide6.QtCore import Qt
 from pytestqt.qtbot import QtBot
 
 from experiment_workbench.model import (
@@ -223,3 +224,18 @@ def test_empty_summary_takes_no_space(view: AnalysisResultView) -> None:
     view.show_result(analysis_id, "応答", AnalysisResult(analysis_id=analysis_id, series=[]))
     assert not view.summary_label.isVisibleTo(view)
     assert not view.conditions_section.isVisibleTo(view)
+
+
+def test_annotation_text_has_no_background(view: AnalysisResultView) -> None:
+    """注記の文字の背景は塗らず、指定の側に置く（線を隠さないように）。"""
+    chart = _chart().model_copy(
+        update={"annotations": [ChartAnnotation(x=2.0, text="左", height=0.5, on_left=True)]}
+    )
+    analysis_id = uuid4()
+    view.show_result(
+        analysis_id, "図", AnalysisResult(analysis_id=analysis_id, series=[], charts=[chart])
+    )
+    (line,) = [item for item in _shown_plot_item(view).items if isinstance(item, pg.InfiniteLine)]
+    assert line.label.fill.style() == Qt.BrushStyle.NoBrush
+    assert line.label.orthoPos == pytest.approx(0.5)
+    assert line.label.anchors == [(1, 0.5), (1, 0.5)]

@@ -592,6 +592,20 @@ def check_alignment_settings(
         raise ValueError(f"範囲の開始 {start_s} s が終了 {end_s} s 以降になっています")
 
 
+def check_time_range(start_s: float | None, end_s: float | None) -> None:
+    """時間の範囲の開始が終了より前であることを確認する。
+
+    Args:
+        start_s: 開始 [s]（指定しなければ None）。
+        end_s: 終了 [s]（指定しなければ None）。
+
+    Raises:
+        ValueError: 開始が終了以降の場合。
+    """
+    if start_s is not None and end_s is not None and start_s >= end_s:
+        raise ValueError(f"範囲の開始 {start_s} s が終了 {end_s} s 以降になっています")
+
+
 def check_onset_threshold(*, fraction_mode: bool, threshold: float) -> None:
     """ステップ応答の、変化の開始を判定するしきい値を確認する。
 

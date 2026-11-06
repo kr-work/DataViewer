@@ -41,8 +41,19 @@ from experiment_workbench.analysis.signal_processing import (
     MovingAverageFilter,
     SavitzkyGolayFilter,
 )
+from experiment_workbench.analysis.transforms import (
+    Detrender,
+    GapFiller,
+    LinearScaler,
+    Normalizer,
+    OffsetRemover,
+    Resampler,
+    StatisticsCalculator,
+    TimeCropper,
+)
 from experiment_workbench.model import (
     DATASET_TIME_COLUMN,
+    METRIC_ANALYSIS_KINDS,
     TWO_CHANNEL_ANALYSIS_KINDS,
     AlignedPair,
     AlignmentRecord,
@@ -58,6 +69,7 @@ from experiment_workbench.model import (
     ChartSeries,
     ChartStyle,
     CrossCorrelationResult,
+    GapFillResult,
     HysteresisResult,
     InterpolationMethod,
     KalmanInitialState,
@@ -65,8 +77,13 @@ from experiment_workbench.model import (
     KalmanSettings,
     KinematicSystemParams,
     LinearSystemParams,
+    MetricDisplay,
+    NormalizeMode,
+    OffsetMode,
     PlotSeries,
     PolynomialObservationParams,
+    ScaleParams,
+    SectionStatistics,
     Source,
     StepResponseResult,
     TimeMarker,
@@ -100,7 +117,41 @@ _FILTER_KINDS = (
     AnalysisKind.MOVING_AVERAGE,
     AnalysisKind.SAVITZKY_GOLAY,
 )
-"""元データから一部の変動を取り除く処理（取り除いた成分を出力できるもの）。"""
+"""生データから一部の成分を除去する処理。"""
+
+_VALUE_TRANSFORM_KINDS = (
+    AnalysisKind.OFFSET,
+    AnalysisKind.SCALE,
+    AnalysisKind.DETREND,
+    AnalysisKind.ABSOLUTE,
+    AnalysisKind.NORMALIZE,
+)
+"""値の変換の処理。"""
+
+_REMOVING_KINDS = (*_FILTER_KINDS, AnalysisKind.DETREND)
+"""除去成分（生データ − 結果）を出力する処理。"""
+
+_OVERLAY_KINDS = (
+    *_FILTER_KINDS,
+    AnalysisKind.ABSOLUTE,
+    AnalysisKind.CROP,
+    AnalysisKind.RESAMPLE,
+    AnalysisKind.FILL_GAPS,
+)
+"""結果を生データと同じ縦軸に重ねられる処理（カルマンフィルタはモデルによるので別に判定する）。
+
+オフセット除去やトレンド除去は単位が同じでも大きさが変わり、重ねると縦軸が広がって波形が
+読めなくなることがあるので、重ねない。
+"""
+
+_NORMALIZE_LABELS = {
+    NormalizeMode.Z_SCORE: "Z スコア",
+    NormalizeMode.MIN_MAX: "最小-最大正規化",
+    NormalizeMode.PEAK: "ピーク正規化",
+}
+
+_UNIT_BRACKETS = (("[", "]"), ("(", ")"), ("（", "）"), ("［", "］"))
+"""列名の末尾で単位を囲む括弧。"""
 
 _MILLISECOND_LIMIT_S = 2.0
 """グラフの時間軸を ms で表す上限 [s]（これより長い範囲は s で表す）。"""
@@ -115,6 +166,26 @@ _MARKER_SUFFIX = "__marker"
 # ---------------------------------------------------------------------------
 
 
+def display_channel_name(channel: Channel) -> str:
+    """チャンネルの表示名を返す（列名の末尾の、単位の括弧を除く）。
+
+    列名が "張力[N]" で単位が "N" のとき、見出しが "張力[N] [N]" と重ならないようにする。
+    ``Channel.name`` は正規化データの列名なので変えず、表示のときだけ除く。
+
+    Args:
+        channel: チャンネル。
+
+    Returns:
+        表示名。
+    """
+    if channel.unit:
+        for left, right in _UNIT_BRACKETS:
+            stripped = channel.name.removesuffix(f"{left}{channel.unit}{right}").rstrip()
+            if stripped and stripped != channel.name:
+                return stripped
+    return channel.name
+
+
 def series_from_channel(data: ChannelData) -> PlotSeries:
     """生データのチャンネルを、表示用の系列にする。
 
@@ -126,8 +197,8 @@ def series_from_channel(data: ChannelData) -> PlotSeries:
     """
     return PlotSeries(
         series_id=data.channel.id,
-        label=f"{data.source.name} / {data.channel.name}",
-        channel_name=data.channel.name,
+        label=f"{data.source.name} / {display_channel_name(data.channel)}",
+        channel_name=display_channel_name(data.channel),
         unit=data.channel.unit,
         source=data.source,
         time_s=data.time_s,
@@ -149,7 +220,7 @@ def overlays_input(spec: AnalysisSpec) -> bool:
     Returns:
         重ねられるなら True。
     """
-    if spec.kind in _FILTER_KINDS:
+    if spec.kind in _OVERLAY_KINDS:
         return True
     if spec.kind is not AnalysisKind.KALMAN:
         return False
@@ -179,8 +250,8 @@ def output_series_id(analysis_id: UUID, key: str) -> UUID:
 def output_infos(spec: AnalysisSpec, channel: Channel) -> list[AnalysisOutputInfo]:
     """解析の出力の一覧を返す（計算はしない）。
 
-    微分・積分の出力は 1 つ（"output"）。フィルタの出力は、処理結果（"output"）と、元データから
-    取り除いた成分（"removed"）。結果の線だけでは、何が取り除かれたかが見えないため。
+    微分・積分の出力は 1 つ（"output"）。フィルタの出力は、処理結果（"output"）と、生データから
+    の除去成分（"removed"）。結果の線だけでは、何が取り除かれたかが見えないため。
     カルマンフィルタ系の出力は、状態ごとの推定値（"state_0"、"state_1" ...）、イノベーション
     （"innovation"）、観測雑音の標準偏差（"noise_std"）。先頭の出力が主な結果になる。
 
@@ -209,15 +280,21 @@ def _outputs(spec: AnalysisSpec, unit: str | None) -> list[tuple[str, str, str |
     Returns:
         (出力名, 表示名, 単位) のリスト。
     """
-    if spec.kind in TWO_CHANNEL_ANALYSIS_KINDS:
+    if spec.kind in METRIC_ANALYSIS_KINDS:
         return []  # 時系列は出力しない（指標・グラフ・時刻の印を結果に入れる）
     if spec.kind is AnalysisKind.DERIVATIVE:
         order = spec.derivative.order if spec.derivative is not None else 1
         return [("output", spec.name, _per_second(unit, order))]
     if spec.kind is AnalysisKind.INTEGRAL:
         return [("output", spec.name, _times_second(unit))]
-    if spec.kind in _FILTER_KINDS:
-        return [("output", spec.name, unit), ("removed", f"{spec.name}: 取り除いた成分", unit)]
+    if spec.kind in _REMOVING_KINDS:
+        return [("output", spec.name, unit), ("removed", f"{spec.name}: 除去成分", unit)]
+    if spec.kind is AnalysisKind.SCALE:
+        return [("output", spec.name, _scaled_unit(_require(spec.scale, "scale"), unit))]
+    if spec.kind is AnalysisKind.NORMALIZE:
+        return [("output", spec.name, None)]  # 正規化した値は無次元
+    if spec.kind is not AnalysisKind.KALMAN:
+        return [("output", spec.name, unit)]
     settings = _require(spec.kalman, "kalman")
     state_labels, state_units = _state_descriptions(settings, unit)
     outputs = [
@@ -227,6 +304,22 @@ def _outputs(spec: AnalysisSpec, unit: str | None) -> list[tuple[str, str, str |
     outputs.append(("innovation", f"{spec.name}: イノベーション", unit))
     outputs.append(("noise_std", f"{spec.name}: √R", unit))
     return outputs
+
+
+def _scaled_unit(params: ScaleParams, unit: str | None) -> str | None:
+    """線形変換の結果の単位を返す。
+
+    Args:
+        params: 線形変換の条件。
+        unit: 入力チャンネルの単位。
+
+    Returns:
+        指定された単位。指定がなければ、値が変わらないときだけ入力の単位を引き継ぐ
+        （倍率を掛けた値に元の単位を付けると、読み間違えるため）。
+    """
+    if params.unit:
+        return params.unit
+    return unit if params.gain == 1.0 and params.offset == 0.0 else None
 
 
 def _state_descriptions(
@@ -253,7 +346,7 @@ def _state_descriptions(
     if settings.model_kind is KalmanModelKind.POLYNOMIAL_OBSERVATION:
         polynomial = _require(settings.polynomial_observation, "polynomial_observation")
         count = polynomial.derivative_order + 1
-        return [f"x の{name}" for name in derivative_names[:count]], [None] * count
+        return derivative_names[:count], [None] * count
     linear = _require(settings.linear, "linear")
     count = len(linear.transition)
     return [f"状態 {index + 1}" for index in range(count)], [None] * count
@@ -291,15 +384,245 @@ def run_analysis(
         raise AnalysisInputError("解析の入力チャンネルと、渡されたデータのチャンネルが違います")
     if spec.kind in TWO_CHANNEL_ANALYSIS_KINDS:
         return _run_two_channel(spec, data, output_data)
+    if spec.kind is AnalysisKind.STATISTICS:
+        return _run_statistics(spec, data)
     infos = output_infos(spec, data.channel)
     if spec.kind is AnalysisKind.KALMAN:
         return _run_kalman(spec, data, infos, progress)
+    if spec.kind in (AnalysisKind.CROP, AnalysisKind.RESAMPLE, AnalysisKind.FILL_GAPS):
+        return _run_time_processing(spec, data, infos)
+    if spec.kind in _VALUE_TRANSFORM_KINDS:
+        return _run_value_transform(spec, data, infos)
     values = _run_signal_processing(spec, data)
     series = [_series(infos[0], spec, data, values)]
     if spec.kind in _FILTER_KINDS:
         series.append(_series(infos[1], spec, data, data.values - values))
     return AnalysisResult(
         analysis_id=spec.id, series=series, headline=_signal_headline(spec, data, values, infos)
+    )
+
+
+def _run_value_transform(
+    spec: AnalysisSpec, data: ChannelData, infos: list[AnalysisOutputInfo]
+) -> AnalysisResult:
+    """値の変換（オフセット除去・線形変換・トレンド除去・絶対値・正規化）を実行する。
+
+    Args:
+        spec: 解析。
+        data: 入力チャンネルのデータ。
+        infos: 出力の情報。
+
+    Returns:
+        解析の結果。
+    """
+    t, x = data.time_s, data.values
+    unit = _unit_text(data.channel.unit)
+    if spec.kind is AnalysisKind.OFFSET:
+        remover = OffsetRemover(_require(spec.offset, "offset"))
+        base = remover.baseline(t, x)
+        how = "指定値" if remover.params.mode is OffsetMode.VALUE else "平均値"
+        values, headline = (
+            remover.apply(t, x),
+            f"基準値 {base:.5g}{unit}（{how}）を差し引きました。",
+        )
+    elif spec.kind is AnalysisKind.SCALE:
+        scale = _require(spec.scale, "scale")
+        values = LinearScaler(scale).apply(t, x)
+        headline = f"y = {scale.gain:.6g} x {scale.offset:+.6g} で変換しました。"
+    elif spec.kind is AnalysisKind.DETREND:
+        detrend = _require(spec.detrend, "detrend")
+        values = Detrender(detrend).apply(t, x)
+        rms = float(np.sqrt(np.nanmean((x - values) ** 2)))
+        headline = f"{detrend.order} 次のトレンドを除去しました（トレンドの RMS {rms:.3g}{unit}）。"
+    elif spec.kind is AnalysisKind.NORMALIZE:
+        mode = _require(spec.normalize, "normalize").mode
+        values = Normalizer(_require(spec.normalize, "normalize")).apply(t, x)
+        headline = f"{_NORMALIZE_LABELS[mode]}で正規化しました。"
+    else:
+        values = np.abs(x)
+        headline = f"絶対値の最大は {float(np.nanmax(values)):.5g}{unit} です。"
+    series = [_series(infos[0], spec, data, values)]
+    if spec.kind in _REMOVING_KINDS:
+        series.append(_series(infos[1], spec, data, x - values))
+    return AnalysisResult(analysis_id=spec.id, series=series, headline=headline)
+
+
+def _run_time_processing(
+    spec: AnalysisSpec, data: ChannelData, infos: list[AnalysisOutputInfo]
+) -> AnalysisResult:
+    """時間の処理（切り出し・リサンプリング・欠損の補間）を実行する。
+
+    Args:
+        spec: 解析。
+        data: 入力チャンネルのデータ。
+        infos: 出力の情報。
+
+    Returns:
+        解析の結果（時刻は入力チャンネルの時間軸のまま）。
+    """
+    t, x = data.time_s, data.values
+    if spec.kind is AnalysisKind.CROP:
+        times, values = TimeCropper(_require(spec.crop, "crop")).apply(t, x)
+        headline = (
+            f"{float(times[0]):.6g}〜{float(times[-1]):.6g} s の {times.size} サンプルを"
+            "切り出しました。"
+        )
+        series = _series(infos[0], spec, data, values, time_s=times)
+        return AnalysisResult(analysis_id=spec.id, series=[series], headline=headline)
+    if spec.kind is AnalysisKind.RESAMPLE:
+        resampled = Resampler(_require(spec.resample, "resample")).apply(t, x)
+        rate = _require(spec.resample, "resample").rate_hz
+        filtered = "アンチエイリアスフィルタあり" if resampled.anti_aliased else "フィルタなし"
+        headline = (
+            f"{resampled.source_rate_hz:.6g} Hz から {rate:.6g} Hz にリサンプリングしました"
+            f"（{t.size} → {resampled.time_s.size} サンプル、{filtered}）。"
+        )
+        series = _series(infos[0], spec, data, resampled.values, time_s=resampled.time_s)
+        return AnalysisResult(
+            analysis_id=spec.id, series=[series], headline=headline, summary=resampled.notes
+        )
+    filled = GapFiller(_require(spec.fill_gaps, "fill_gaps")).apply(t, x)
+    markers = t[filled.filled_mask] if filled.n_filled else None
+    series = _series(infos[0], spec, data, filled.values, markers=markers)
+    return AnalysisResult(analysis_id=spec.id, series=[series], headline=_gap_headline(filled))
+
+
+def _gap_headline(filled: GapFillResult) -> str:
+    """欠損の補間の結果を、数値入りの一文にする。
+
+    Args:
+        filled: 補間の結果。
+
+    Returns:
+        結果の一文。
+    """
+    # 行ごと欠けた区間は NaN として現れない。「欠損なし」と読めないように必ず併記する。
+    jumps = (
+        f"時刻が飛んでいる区間が {filled.n_time_gaps} か所あります"
+        f"（最長 {filled.longest_time_gap_s:.4g} s）。行ごと欠けた区間はこの処理では埋まりません。"
+        "リサンプリングの「欠損とみなす間隔の倍率」を大きくすると補間できます。"
+        if filled.n_time_gaps
+        else ""
+    )
+    if filled.n_missing == 0:
+        return f"NaN の欠損はありません（値は変わりません）。{jumps}"
+    remaining = filled.n_missing - filled.n_filled
+    tail = (
+        f"{remaining} 個は補間していません（端の欠損、または上限より長い欠損）。"
+        if remaining
+        else ""
+    )
+    return (
+        f"欠損 {filled.n_missing} 個のうち {filled.n_filled} 個を補間しました（× 印）。"
+        f"{tail}{jumps}"
+    )
+
+
+def _run_statistics(spec: AnalysisSpec, data: ChannelData) -> AnalysisResult:
+    """区間統計を実行し、指標の表とヒストグラムにする。
+
+    Args:
+        spec: 解析。
+        data: 入力チャンネルのデータ。
+
+    Returns:
+        解析の結果（時系列の出力はない）。
+    """
+    stats = StatisticsCalculator(_require(spec.statistics, "statistics")).compute(
+        data.time_s, data.values
+    )
+    unit = data.channel.unit
+    text = _unit_text(unit)
+    headline = (
+        f"平均 {stats.mean:.5g}{text}、標準偏差 {stats.std:.3g}{text}、"
+        f"最大 {stats.maximum:.5g}{text}、最小 {stats.minimum:.5g}{text} です。"
+    )
+    summary = (
+        [f"区間の中の欠損 {stats.n_missing} 個は除いて計算しました"] if stats.n_missing else []
+    )
+    conditions = [
+        f"区間: {stats.start_s:.6g}〜{stats.end_s:.6g} s（{stats.n_samples} サンプル）",
+        "標準偏差は不偏分散の平方根（自由度 n − 1）",
+    ]
+    return AnalysisResult(
+        analysis_id=spec.id,
+        series=[],
+        headline=headline,
+        summary=summary,
+        conditions=conditions,
+        metrics=_statistics_metrics(stats, unit),
+        charts=[_histogram_chart(stats, data)],
+        time_markers=[
+            TimeMarker(time_s=stats.maximum_time_s, label="最大"),
+            TimeMarker(time_s=stats.minimum_time_s, label="最小"),
+        ],
+    )
+
+
+def _statistics_metrics(stats: SectionStatistics, unit: str | None) -> list[AnalysisMetric]:
+    """区間の統計量を、指標の表にする。
+
+    Args:
+        stats: 区間の統計量。
+        unit: 値の単位。
+
+    Returns:
+        指標のリスト。
+    """
+    return [
+        _metric("mean", "平均値", stats.mean, unit),
+        _metric("std", "標準偏差", stats.std, unit, "不偏分散の平方根（自由度 n − 1）"),
+        _metric("rms", "実効値（RMS）", stats.rms, unit, "二乗平均平方根"),
+        _metric("maximum", "最大値", stats.maximum, unit),
+        _metric("minimum", "最小値", stats.minimum, unit),
+        _metric(
+            "peak_to_peak", "ピーク間振幅", stats.maximum - stats.minimum, unit, "最大値 − 最小値"
+        ),
+        _metric("median", "中央値", stats.median, unit),
+        _metric(
+            "maximum_time_s",
+            "最大値の時刻",
+            stats.maximum_time_s,
+            "s",
+            display=MetricDisplay.INSTANT,
+        ),
+        _metric(
+            "minimum_time_s",
+            "最小値の時刻",
+            stats.minimum_time_s,
+            "s",
+            display=MetricDisplay.INSTANT,
+        ),
+        _metric("n_samples", "サンプル数", float(stats.n_samples), display=MetricDisplay.COUNT),
+    ]
+
+
+def _histogram_chart(stats: SectionStatistics, data: ChannelData) -> AnalysisChart:
+    """値の分布のグラフを作る。
+
+    Args:
+        stats: 区間の統計量。
+        data: 入力チャンネルのデータ。
+
+    Returns:
+        グラフ。
+    """
+    name = display_channel_name(data.channel)
+    return AnalysisChart(
+        title="値の分布（ヒストグラム）",
+        x_label=_axis_label(name, data.channel.unit),
+        y_label="度数",
+        series=[
+            ChartSeries(
+                label="度数",
+                x=stats.histogram_centers,
+                y=stats.histogram_counts,
+                style=ChartStyle.BARS,
+                color=_DECREASING_COLOR,
+                show_in_legend=False,
+            )
+        ],
+        annotations=[ChartAnnotation(x=stats.mean, text=f"平均 {stats.mean:.4g}")],
     )
 
 
@@ -322,14 +645,14 @@ def _signal_headline(
         return ""
     unit = _unit_text(infos[0].unit)
     if spec.kind is AnalysisKind.DERIVATIVE:
-        return f"変化の速さは最大で {float(np.max(np.abs(finite))):.3g}{unit} でした。"
+        return f"微分値の絶対値の最大は {float(np.max(np.abs(finite))):.3g}{unit} です。"
     if spec.kind is AnalysisKind.INTEGRAL:
-        return f"積み上げた値は、最後に {float(finite[-1]):.3g}{unit} になりました。"
+        return f"積分の最終値は {float(finite[-1]):.3g}{unit} です。"
     removed = data.values - values
     rms = float(np.sqrt(np.nanmean(removed**2)))
     spread = float(np.nanstd(data.values))
-    share = f"（元の変動の {100.0 * rms / spread:.3g} %）" if spread > 0 else ""
-    return f"元データから大きさ {rms:.3g}{unit} の変動を取り除きました{share}。"
+    share = f"（生データの標準偏差の {100.0 * rms / spread:.3g} %）" if spread > 0 else ""
+    return f"除去成分の RMS は {rms:.3g}{unit} です{share}。"
 
 
 def _unit_text(unit: str | None) -> str:
@@ -428,8 +751,8 @@ def _run_kalman(
     sigma = np.sqrt(np.maximum(result.covariances[:, 0, 0], 0.0))
     innovation_rms = float(np.sqrt(np.nanmean(result.innovations[:, 0] ** 2)))
     headline = (
-        f"推定の不確かさは平均 ±{float(np.mean(sigma)):.3g}、"
-        f"観測との差は平均して {innovation_rms:.3g}{unit} でした。"
+        f"推定値の標準偏差は平均 {float(np.mean(sigma)):.3g}、"
+        f"イノベーションの RMS は {innovation_rms:.3g}{unit} です。"
     )
     return AnalysisResult(analysis_id=spec.id, series=series, headline=headline, summary=summary)
 
@@ -441,6 +764,8 @@ def _series(
     values: FloatArray,
     sigma: FloatArray | None = None,
     markers: FloatArray | None = None,
+    *,
+    time_s: FloatArray | None = None,
 ) -> PlotSeries:
     """出力の値から表示用の系列を作る（帯は値 ± sigma）。
 
@@ -451,6 +776,7 @@ def _series(
         values: 出力の値。
         sigma: 帯の半幅。None なら帯なし。
         markers: 印を付ける時刻。None なら印なし。
+        time_s: 出力の時刻 [s]。None なら入力の時刻（切り出しなどで長さが変わるときに指定する）。
 
     Returns:
         表示用の系列。
@@ -458,10 +784,10 @@ def _series(
     return PlotSeries(
         series_id=info.series_id,
         label=info.label,
-        channel_name=data.channel.name,
+        channel_name=display_channel_name(data.channel),
         unit=info.unit,
         source=data.source,
-        time_s=data.time_s,
+        time_s=data.time_s if time_s is None else time_s,
         values=np.asarray(values, dtype=np.float64),
         band_lower=None if sigma is None else np.asarray(values - sigma, dtype=np.float64),
         band_upper=None if sigma is None else np.asarray(values + sigma, dtype=np.float64),
@@ -538,57 +864,68 @@ def _step_response_result(
     metrics = [
         _metric(
             "response_delay_s",
-            "動き始めるまでの遅れ",
+            "応答開始遅れ",
             step.response_delay_s,
             "s",
-            "入力の変化の開始から、出力が同じ割合だけ変化するまで",
+            "入力の変化開始から、出力が同じしきい値を超えるまでの時間",
         ),
         _metric(
             "delay_time_s",
-            "半分に達するまで Td",
+            "遅れ時間 Td",
             step.delay_time_s,
             "s",
-            "出力が変化量の 50% に達するまで",
+            "出力が変化量の 50 % に達するまでの時間",
         ),
         _metric(
             "rise_time_s",
             "立ち上がり時間 Tr",
             step.rise_time_s,
             "s",
-            "出力が変化量の 10% から 90% になるまで",
+            "出力が変化量の 10 % から 90 % に達するまでの時間",
         ),
         _metric(
             "time_constant_s",
             "時定数 τ",
             step.time_constant_s,
             "s",
-            "一次遅れ＋むだ時間で近似（2 点法）",
+            "一次遅れ＋むだ時間モデルの 2 点法による推定値",
         ),
         _metric(
-            "dead_time_s", "むだ時間 L", step.dead_time_s, "s", "一次遅れ＋むだ時間で近似（2 点法）"
+            "dead_time_s",
+            "むだ時間 L",
+            step.dead_time_s,
+            "s",
+            "一次遅れ＋むだ時間モデルの 2 点法による推定値",
         ),
         _metric(
             "settling_time_s",
-            "落ち着くまで Ts",
+            "整定時間 Ts",
             step.settling_time_s,
             "s",
-            f"出力が最終値の ±{settling_band * 100:.3g}% に入ったまま出なくなるまで",
+            f"出力が最終値の ±{settling_band * 100:.3g} % 以内に収まるまでの時間",
         ),
         _metric(
             "overshoot_percent",
-            "行き過ぎ（オーバーシュート）",
+            "オーバーシュート",
             _percent(step.overshoot),
             "%",
             "出力の変化量に対する割合",
         ),
         _metric(
             "gain",
-            "感度（ゲイン）",
+            "定常ゲイン",
             step.gain,
             _ratio(output_unit, input_unit),
             "出力の変化量 ÷ 入力の変化量",
         ),
-        _metric("input_onset_s", "入力の変化の開始", step.input_onset_s, "s", "入力の時間軸の時刻"),
+        _metric(
+            "input_onset_s",
+            "入力の変化開始時刻",
+            step.input_onset_s,
+            "s",
+            "入力の時間軸の時刻",
+            display=MetricDisplay.INSTANT,
+        ),
         _metric("input_initial", "入力の初期値", step.input_initial, input_unit),
         _metric("input_final", "入力の最終値", step.input_final, input_unit),
         _metric("output_initial", "出力の初期値", step.output_initial, output_unit),
@@ -617,14 +954,13 @@ def _step_headline(step: StepResponseResult) -> str:
     """
     parts = []
     if step.response_delay_s is not None:
-        parts.append(f"入力の変化から {_time_text(step.response_delay_s)} 遅れて動き始め")
+        parts.append(f"応答開始遅れは {_time_text(step.response_delay_s)}")
     if step.delay_time_s is not None:
-        parts.append(f"{_time_text(step.delay_time_s)} で変化の半分に達し")
+        parts.append(f"遅れ時間 Td は {_time_text(step.delay_time_s)}")
     if step.settling_time_s is not None:
-        parts.append(f"{_time_text(step.settling_time_s)} で落ち着きました")
-    else:
-        parts.append("範囲の中では落ち着きませんでした")
-    return "出力は" + "、".join(parts) + "。"
+        parts.append(f"整定時間 Ts は {_time_text(step.settling_time_s)}")
+        return "、".join(parts) + " です。"
+    return "、".join([*parts, "解析範囲内では整定していません"]) + "。"
 
 
 def _step_markers(step: StepResponseResult) -> list[TimeMarker]:
@@ -679,20 +1015,22 @@ def _step_chart(step: StepResponseResult) -> AnalysisChart:
             show_in_legend=False,
         ),
     ]
-    annotations = [ChartAnnotation(x=0.0, text="① 入力が変化")]
-    for offset, label in (
-        (step.response_delay_s, "② 動き始め"),
-        (step.delay_time_s, "③ 半分"),
-        (step.settling_time_s, "④ 落ち着く"),
+    # 曲線は左下から右上へ上がるので、文字は曲線のない所に置く（入力の変化より左と、曲線の下）。
+    annotations = [ChartAnnotation(x=0.0, text="① 入力の変化開始", height=0.88, on_left=True)]
+    for offset, label, height, on_left in (
+        (step.response_delay_s, "② 応答開始", 0.62, True),
+        (step.delay_time_s, "③ 遅れ時間 Td", 0.22, False),
+        (step.settling_time_s, "④ 整定時間 Ts", 0.12, False),
     ):
         if offset is not None:
+            text = f"{label} {_time_text(offset)}"
             annotations.append(
-                ChartAnnotation(x=offset * scale, text=f"{label} {_time_text(offset)}")
+                ChartAnnotation(x=offset * scale, text=text, height=height, on_left=on_left)
             )
     return AnalysisChart(
-        title="入力が変わってから、出力が追いつくまで",
-        x_label=f"入力が変わってからの時間 [{time_unit}]",
-        y_label="変化の割合 [%]",
+        title="ステップ応答（入力の変化開始を 0、変化量を 100 % に正規化）",
+        x_label=f"入力の変化開始からの時間 [{time_unit}]",
+        y_label="正規化した応答 [%]",
         series=series,
         annotations=annotations,
     )
@@ -797,27 +1135,29 @@ def _hysteresis_headline(
         結果の一文。
     """
     if loop.max_hysteresis is None:
+        return "増加時と減少時を比較できませんでした（入力が往復する範囲を選んでください）。"
+    unit = _unit_text(output_unit)
+    if loop.direction_unstable:
+        # 数値を結論として読まれないよう、注意を先に書く。
         return (
-            "増やすときと減らすときを比べられませんでした（入力が往復する範囲を選んでください）。"
+            "入力の雑音で、増加時と減少時を正しく分離できていません。"
+            f"最大ヒステリシス {loop.max_hysteresis:.3g}{unit} は過小評価の可能性があります。"
+            "変化方向の判定に平滑化を使ってください。"
         )
-    share = (
-        f"（出力の全幅の {_percent(loop.hysteresis_ratio):.3g} %）" if loop.hysteresis_ratio else ""
-    )
+    ratio = _percent(loop.hysteresis_ratio)
+    share = f"（FS の {ratio:.3g} %）" if ratio is not None else ""
     place = (
-        f"入力 {loop.max_hysteresis_input:.3g}{_unit_text(input_unit)} の付近で"
+        f"で、入力 {loop.max_hysteresis_input:.3g}{_unit_text(input_unit)} の付近で生じています"
         if loop.max_hysteresis_input is not None
         else ""
     )
-    return (
-        f"同じ入力でも、増やすときと減らすときで出力が違います。{place}最大 "
-        f"{loop.max_hysteresis:.3g}{_unit_text(output_unit)} の差があります{share}。"
-    )
+    return f"最大ヒステリシスは {loop.max_hysteresis:.3g}{unit}{share}{place}。"
 
 
 def _hysteresis_charts(
     data: ChannelData, output_data: ChannelData, pair: AlignedPair, loop: HysteresisResult
 ) -> list[AnalysisChart]:
-    """入力と出力の関係のグラフと、増やすときと減らすときの差のグラフを作る。
+    """入力と出力の関係のグラフと、増加時と減少時の差のグラフを作る。
 
     差はループの線の間隔として読むには小さいことが多いので、差そのものも別のグラフで見せる。
     測定値の点は背景として薄く 1 色で描き、読み取ってほしい線を前に出す。
@@ -832,7 +1172,7 @@ def _hysteresis_charts(
         グラフのリスト。
     """
     input_unit, output_unit = data.channel.unit, output_data.channel.unit
-    x_label = _axis_label(f"入力 {data.channel.name}", input_unit)
+    x_label = _axis_label(f"入力 {display_channel_name(data.channel)}", input_unit)
     finite_pair = np.isfinite(pair.input_values) & np.isfinite(pair.output_values)
     x_points, y_points = _thin(pair.input_values[finite_pair], pair.output_values[finite_pair])
     series = [
@@ -846,8 +1186,8 @@ def _hysteresis_charts(
         )
     ]
     for label, branch, color in (
-        ("増やすとき", loop.increasing_branch, _INCREASING_COLOR),
-        ("減らすとき", loop.decreasing_branch, _DECREASING_COLOR),
+        ("増加時", loop.increasing_branch, _INCREASING_COLOR),
+        ("減少時", loop.decreasing_branch, _DECREASING_COLOR),
     ):
         finite = np.isfinite(branch)
         if finite.any():
@@ -857,7 +1197,7 @@ def _hysteresis_charts(
     ends = np.array([loop.input_min, loop.input_max])
     series.append(
         ChartSeries(
-            label="直線で近似",
+            label="回帰直線",
             x=ends,
             y=loop.slope * ends + loop.intercept,
             style=ChartStyle.DASHED,
@@ -866,13 +1206,14 @@ def _hysteresis_charts(
     )
     annotations = []
     if loop.max_hysteresis_input is not None and loop.max_hysteresis is not None:
-        text = f"差が最大 {loop.max_hysteresis:.3g}{_unit_text(output_unit)}"
-        annotations.append(ChartAnnotation(x=loop.max_hysteresis_input, text=text))
+        text = f"最大ヒステリシス {loop.max_hysteresis:.3g}{_unit_text(output_unit)}"
+        # 線は左下から右上へ延びるので、右下の空いた所に文字を置く。
+        annotations.append(ChartAnnotation(x=loop.max_hysteresis_input, text=text, height=0.14))
     charts = [
         AnalysisChart(
-            title="入力と出力の関係（増やすとき・減らすとき）",
+            title="入出力特性（ヒステリシスループ）",
             x_label=x_label,
-            y_label=_axis_label(f"出力 {output_data.channel.name}", output_unit),
+            y_label=_axis_label(f"出力 {display_channel_name(output_data.channel)}", output_unit),
             series=series,
             annotations=annotations,
         )
@@ -882,12 +1223,12 @@ def _hysteresis_charts(
     if both.any():
         charts.append(
             AnalysisChart(
-                title="増やすときと減らすときの差",
+                title="分岐の差（増加時 − 減少時）",
                 x_label=x_label,
-                y_label=_axis_label("出力の差", output_unit),
+                y_label=_axis_label("分岐の差", output_unit),
                 series=[
                     ChartSeries(
-                        label="増やすとき − 減らすとき",
+                        label="増加時 − 減少時",
                         x=loop.bin_centers[both],
                         y=difference[both],
                         color=_DECREASING_COLOR,
@@ -926,19 +1267,19 @@ def _cross_correlation_result(
     lag_span = float(np.max(np.abs(correlation.lags_s)))
     scale, time_unit = (1000.0, "ms") if lag_span < _MILLISECOND_LIMIT_S else (1.0, "s")
     chart = AnalysisChart(
-        title="どれだけずらすと、入力と出力の波形が重なるか",
-        x_label=f"ずらす時間 [{time_unit}]（正: 出力が遅れている）",
-        y_label="波形の一致度（相関係数）",
+        title="相互相関関数",
+        x_label=f"ラグ [{time_unit}]（正: 出力が遅れている）",
+        y_label="相関係数",
         series=[
             ChartSeries(
-                label="一致度",
+                label="相関係数",
                 x=correlation.lags_s * scale,
                 y=correlation.coefficients,
                 color=_DECREASING_COLOR,
                 show_in_legend=False,
             ),
             ChartSeries(
-                label="最も重なる位置",
+                label="ピーク",
                 x=np.array([correlation.delay_s * scale]),
                 y=np.array([correlation.peak_coefficient]),
                 style=ChartStyle.MARKERS,
@@ -949,7 +1290,7 @@ def _cross_correlation_result(
         annotations=[
             ChartAnnotation(
                 x=correlation.delay_s * scale,
-                text=f"最も重なる {_time_text(correlation.delay_s)}",
+                text=f"ピーク {_time_text(correlation.delay_s)}",
             )
         ],
     )
@@ -974,15 +1315,13 @@ def _correlation_headline(correlation: CrossCorrelationResult) -> str:
         結果の一文。
     """
     delay = correlation.delay_s
-    relation = (
-        "遅れています" if delay > 0 else "進んでいます" if delay < 0 else "同時に動いています"
-    )
-    timing = f"{_time_text(abs(delay))} {relation}" if delay != 0 else relation
-    direction = "（逆向きに変化しています）" if correlation.peak_coefficient < 0 else ""
-    return (
-        f"出力は入力より {timing}{direction}。"
-        f"波形の一致度は {abs(correlation.peak_coefficient):.3g} です（1 で完全に一致）。"
-    )
+    if delay == 0:
+        timing = "出力と入力の間に遅れはありません"
+    else:
+        relation = "遅れています" if delay > 0 else "進んでいます"
+        timing = f"出力は入力に対して {_time_text(abs(delay))} {relation}"
+    sign = "（負の相関）" if correlation.peak_coefficient < 0 else ""
+    return f"{timing}（相関係数 {correlation.peak_coefficient:.3g}{sign}）。"
 
 
 def _alignment_notes(record: AlignmentRecord) -> list[str]:
@@ -1033,7 +1372,13 @@ def _alignment_conditions(record: AlignmentRecord) -> list[str]:
 
 
 def _metric(
-    key: str, label: str, value: float | None, unit: str | None = None, note: str = ""
+    key: str,
+    label: str,
+    value: float | None,
+    unit: str | None = None,
+    note: str = "",
+    *,
+    display: MetricDisplay = MetricDisplay.QUANTITY,
 ) -> AnalysisMetric:
     """指標を作る。
 
@@ -1043,11 +1388,12 @@ def _metric(
         value: 値。求められなければ None。
         unit: 単位。
         note: 指標の定義。
+        display: 値の書き方。
 
     Returns:
         指標。
     """
-    return AnalysisMetric(key=key, label=label, value=value, unit=unit, note=note)
+    return AnalysisMetric(key=key, label=label, value=value, unit=unit, note=note, display=display)
 
 
 def _percent(ratio: float | None) -> float | None:
@@ -1197,7 +1543,7 @@ def result_from_frame(
             PlotSeries(
                 series_id=info.series_id,
                 label=info.label,
-                channel_name=channel.name,
+                channel_name=display_channel_name(channel),
                 unit=info.unit,
                 source=source,
                 time_s=time_s,

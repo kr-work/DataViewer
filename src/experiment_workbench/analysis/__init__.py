@@ -1,4 +1,4 @@
-"""解析コア（SPEC §7 A-01〜A-11）: フィルタ・微分・積分・カルマンフィルタ系、入出力関係の解析。
+"""解析コア（SPEC §7）: 信号処理・カルマンフィルタ系・入出力解析・値の変換・時間の処理。
 
 GUI に依存せず、時刻配列と値の配列を受け取って新しい配列（または推定結果）を返す。
 処理の条件は ``experiment_workbench.model`` の pydantic モデルで指定する。
@@ -31,6 +31,7 @@ from experiment_workbench.analysis.runner import (
     default_initial_state,
     default_kalman_settings,
     default_omega,
+    display_channel_name,
     estimate_noise_std,
     output_infos,
     output_series_id,
@@ -55,6 +56,16 @@ from experiment_workbench.analysis.signal_processing import (
     validate_series,
     validate_time_axis,
 )
+from experiment_workbench.analysis.transforms import (
+    Detrender,
+    GapFiller,
+    LinearScaler,
+    Normalizer,
+    OffsetRemover,
+    Resampler,
+    StatisticsCalculator,
+    TimeCropper,
+)
 
 __all__ = [
     "DEFAULT_UNIFORM_TOLERANCE",
@@ -63,24 +74,33 @@ __all__ = [
     "ButterworthFilter",
     "ChannelAligner",
     "CrossCorrelationAnalyzer",
+    "Detrender",
     "Differentiator",
+    "GapFiller",
     "HysteresisAnalyzer",
     "Integrator",
     "KalmanFilter",
     "KinematicSystem",
+    "LinearScaler",
     "LinearSystem",
     "MovingAverageFilter",
     "NonlinearSystem",
+    "Normalizer",
+    "OffsetRemover",
     "PolynomialObservationSystem",
     "ProgressCallback",
+    "Resampler",
     "SavitzkyGolayFilter",
     "StateSpaceSystem",
+    "StatisticsCalculator",
     "StepResponseAnalyzer",
+    "TimeCropper",
     "analysis_fingerprint",
     "check_uniform_sampling",
     "default_initial_state",
     "default_kalman_settings",
     "default_omega",
+    "display_channel_name",
     "estimate_noise_std",
     "estimate_sampling_rate",
     "kinematic_process_noise",

@@ -32,6 +32,7 @@ from experiment_workbench.model import (
     ChartAnnotation,
     ChartSeries,
     ChartStyle,
+    MetricDisplay,
 )
 from experiment_workbench.ui.analysis_panel import CollapsibleSection
 from experiment_workbench.ui.theme import (
@@ -51,8 +52,6 @@ _POINT_ALPHA = 90
 _MARKER_SIZE = 11
 _TABLE_WIDTH = 330
 _TABLE_MIN_HEIGHT = 40
-_ANNOTATION_POSITIONS = (0.94, 0.8, 0.66, 0.52)
-"""グラフの注記の文字を置く高さ（近い位置の注記が重ならないよう、順に変える）。"""
 
 
 class AnalysisResultView(QWidget):
@@ -189,7 +188,9 @@ class AnalysisResultView(QWidget):
 def _display_value(metric: AnalysisMetric) -> tuple[str, str]:
     """指標の値を表に出す文字列にする（1 秒未満の時間はミリ秒で表す）。
 
-    遅れや時定数はミリ秒の桁で読むことが多いため。保存される値は秒のまま。
+    遅れや時定数はミリ秒の桁で読むことが多いため。保存される値は秒のまま。時刻（時間軸の上の
+    位置）は長さではなく、グラフの目盛りと見比べるので、ミリ秒にせず秒のまま書く。個数は
+    有効数字で丸めると指数表記になるので、整数のまま書く。
 
     Args:
         metric: 指標。
@@ -200,6 +201,10 @@ def _display_value(metric: AnalysisMetric) -> tuple[str, str]:
     unit = metric.unit or ""
     if metric.value is None:
         return _NO_VALUE, unit
+    if metric.display is MetricDisplay.COUNT:
+        return f"{metric.value:.0f}", unit
+    if metric.display is MetricDisplay.INSTANT:
+        return f"{metric.value:.4f}", unit
     if unit == "s" and abs(metric.value) < 1.0:
         return f"{metric.value * 1000.0:.4g}", "ms"
     return f"{metric.value:.5g}", unit
@@ -238,20 +243,21 @@ def _chart_widget(chart: AnalysisChart) -> pg.PlotWidget:
     legend.setLabelTextColor(TEXT)
     for index, series in enumerate(chart.series):
         _draw_series(item, series, series.color or series_color(index))
-    for index, annotation in enumerate(chart.annotations):
-        _draw_annotation(item, annotation, index)
+    for annotation in chart.annotations:
+        _draw_annotation(item, annotation)
     return widget
 
 
-def _draw_annotation(item: pg.PlotItem, annotation: ChartAnnotation, index: int) -> None:
+def _draw_annotation(item: pg.PlotItem, annotation: ChartAnnotation) -> None:
     """グラフに注記（縦線と文字）を書き込む。
+
+    文字の背景は透明にする（塗ると、読み取ってほしい線が隠れてしまうため）。
 
     Args:
         item: 描く先の PlotItem。
         annotation: 注記。
-        index: 注記の番号（文字の高さを順に変える）。
     """
-    position = _ANNOTATION_POSITIONS[index % len(_ANNOTATION_POSITIONS)]
+    anchor = (1, 0.5) if annotation.on_left else (0, 0.5)
     line = pg.InfiniteLine(
         pos=annotation.x,
         angle=90,
@@ -259,10 +265,9 @@ def _draw_annotation(item: pg.PlotItem, annotation: ChartAnnotation, index: int)
         pen=pg.mkPen(MUTED, width=1, style=Qt.PenStyle.DotLine),
         label=annotation.text,
         labelOpts={
-            "position": position,
+            "position": annotation.height,
             "color": TEXT,
-            "fill": (255, 255, 255, 225),
-            "anchors": [(0, 0.5), (0, 0.5)],
+            "anchors": [anchor, anchor],
         },
     )
     item.addItem(line, ignoreBounds=True)
@@ -302,6 +307,13 @@ def _draw_series(item: pg.PlotItem, series: ChartSeries, color: str) -> None:
             symbolBrush=pg.mkBrush(color),
             name=name,
         )
+    elif series.style is ChartStyle.BARS:
+        # 棒の間を空けない（階級は連続しているので、隙間があると離散の値に見える）。
+        width = float(np.median(np.diff(x))) if x.size > 1 else 1.0
+        bars = pg.BarGraphItem(
+            x=x, height=y, width=width, brush=pg.mkBrush(color), pen=pg.mkPen("#ffffff", width=0.5)
+        )
+        item.addItem(bars)
     else:
         style = Qt.PenStyle.DashLine if series.style is ChartStyle.DASHED else Qt.PenStyle.SolidLine
         pen = pg.mkPen(color, width=_LINE_WIDTH, style=style)

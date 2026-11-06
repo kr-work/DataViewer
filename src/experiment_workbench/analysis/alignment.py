@@ -216,7 +216,7 @@ class ChannelAligner:
     def _resample(
         self, t_src: FloatArray, v_src: FloatArray, grid: FloatArray, name: str
     ) -> tuple[FloatArray, BoolArray]:
-        """チャンネルの値を、指定した時刻での値に補間する（外挿せず、欠損区間をまたがない）。
+        """チャンネルの値を、指定した時刻での値に補間する（interpolate_on_grid を参照）。
 
         時刻の並びは、元のチャンネルの時刻の範囲の中にある（重なりの範囲から作るため外挿にならない）。
 
@@ -228,28 +228,56 @@ class ChannelAligner:
 
         Returns:
             (補間した値, 欠損区間に入ったため NaN にした時刻)。
-
-        Raises:
-            AnalysisInputError: PCHIP 補間で、使う区間に欠損（NaN）がある場合。
         """
-        # 時刻の並びを囲む区間だけを取り出す（PCHIP の計算を軽くし、欠損の確認を範囲内に限るため）。
-        first = max(int(np.searchsorted(t_src, grid[0], side="right")) - 1, 0)
-        last = min(int(np.searchsorted(t_src, grid[-1], side="left")) + 1, t_src.size)
-        t_win, v_win = t_src[first:last], v_src[first:last]
-        if self.params.method is InterpolationMethod.LINEAR:
-            # 線形補間では、欠損（NaN）に隣り合う区間の値は NaN になる（欠損を埋めない）。
-            values = np.interp(grid, t_win, v_win)
-        else:
-            missing = np.isnan(v_win)
-            if missing.any():
-                raise AnalysisInputError(
-                    f"{name}チャンネルの範囲内に欠損（NaN）が {int(missing.sum())} 個あるため、"
-                    "PCHIP 補間はできません。線形補間を選ぶか、欠損のない範囲を選んでください"
-                )
-            values = PchipInterpolator(t_win, v_win, extrapolate=False)(grid)
-        gap = _in_gap(t_src, t_win, grid, self.params.max_gap_factor)
-        values = np.where(gap, np.nan, values)
-        return np.asarray(values, dtype=np.float64), gap
+        return interpolate_on_grid(
+            t_src, v_src, grid, self.params.method, self.params.max_gap_factor, name
+        )
+
+
+def interpolate_on_grid(
+    t_src: FloatArray,
+    v_src: FloatArray,
+    grid: FloatArray,
+    method: InterpolationMethod,
+    max_gap_factor: float,
+    name: str,
+) -> tuple[FloatArray, BoolArray]:
+    """値を、指定した時刻での値に補間する（外挿せず、欠損区間をまたがない）。
+
+    時刻の並びは、元の時刻の範囲の中にあること。
+
+    Args:
+        t_src: 元の時刻 [s]。
+        v_src: 元の値（欠損は NaN）。
+        grid: 値を求める時刻 [s]。
+        method: 補間方法。
+        max_gap_factor: 欠損区間とみなす時刻の間隔の、間隔の中央値に対する倍率。
+        name: エラーメッセージに使うチャンネルの呼び名（"入力" など）。
+
+    Returns:
+        (補間した値, 欠損区間に入ったため NaN にした時刻)。
+
+    Raises:
+        AnalysisInputError: PCHIP 補間で、使う区間に欠損（NaN）がある場合。
+    """
+    # 時刻の並びを囲む区間だけを取り出す（PCHIP の計算を軽くし、欠損の確認を範囲内に限るため）。
+    first = max(int(np.searchsorted(t_src, grid[0], side="right")) - 1, 0)
+    last = min(int(np.searchsorted(t_src, grid[-1], side="left")) + 1, t_src.size)
+    t_win, v_win = t_src[first:last], v_src[first:last]
+    if method is InterpolationMethod.LINEAR:
+        # 線形補間では、欠損（NaN）に隣り合う区間の値は NaN になる（欠損を埋めない）。
+        values = np.interp(grid, t_win, v_win)
+    else:
+        missing = np.isnan(v_win)
+        if missing.any():
+            raise AnalysisInputError(
+                f"{name}チャンネルの範囲内に欠損（NaN）が {int(missing.sum())} 個あるため、"
+                "PCHIP 補間はできません。線形補間を選ぶか、欠損のない範囲を選んでください"
+            )
+        values = PchipInterpolator(t_win, v_win, extrapolate=False)(grid)
+    gap = _in_gap(t_src, t_win, grid, max_gap_factor)
+    values = np.where(gap, np.nan, values)
+    return np.asarray(values, dtype=np.float64), gap
 
 
 def _checked_values(values: FloatArray, times: FloatArray, name: str) -> FloatArray:
