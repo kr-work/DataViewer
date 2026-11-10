@@ -28,6 +28,7 @@ jobs:
     env:
       QT_QPA_PLATFORM: offscreen
       UV_PYTHON_DOWNLOADS: never
+      PYTHONUTF8: "1"  # 日本語の出力のため（Windows の Actions では標準出力が cp1252 になる）
     steps:
       - uses: actions/checkout@v4
       - name: Install Qt system libraries (Ubuntu)
