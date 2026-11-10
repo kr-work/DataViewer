@@ -57,10 +57,11 @@ uv sync
 
 `uv sync` で `.venv` に依存パッケージと開発ツールがインストールされます。
 
-Ubuntu で GUI が起動しない場合は、Qt が使うシステムライブラリを入れてください。
+Ubuntu で GUI が起動しない場合は、Qt が使うシステムライブラリを入れてください（Release の実行ファイルも同じです。
+`libsqlite3-0` は実行ファイルが使います。デスクトップ版の Ubuntu には通常入っています）。
 
 ```bash
-sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libxcb-cursor0 libfontconfig1 libdbus-1-3
+sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libxcb-cursor0 libfontconfig1 libdbus-1-3 libsqlite3-0
 ```
 
 ## GUI の起動と基本操作
@@ -188,8 +189,35 @@ uv run ewb path/to/data.csv # ファイルを開いて起動
 uv run pytest                 # テスト
 uv run ruff check .           # Lint
 uv run ruff format .          # フォーマット（確認だけなら --check）
-uv run mypy                   # 型チェック（src と tests）
+uv run mypy                   # 型チェック（src・tests・packaging）
 ```
+
+## 配布用の実行ファイル（Release）
+
+Python を入れていない人も使えるよう、Windows と Ubuntu の実行ファイルを GitHub の Release で配ります。
+
+1. `pyproject.toml` の `version` を上げてコミットし、push します。
+2. 同じ版のタグを付けて push します（例: `git tag v0.1.0` → `git push origin v0.1.0`）。
+3. GitHub Actions（`release.yml`）が検査を通したうえで実行ファイルを作り、Release に載せます。タグと `version` が違うと止まります。
+
+Actions の画面から手動で実行すると、Release は作らずに実行ファイルだけを成果物（Artifacts）に置きます（試し用）。
+
+配る実行ファイル:
+
+- 形式: 展開して中の `ExperimentWorkbench`（Windows は `ExperimentWorkbench.exe`）を起動するフォルダ形式です。Qt を
+  差し替えられるよう、1 つのファイルにはまとめていません（LGPL のため）。
+- 同梱物のライセンス: 展開したフォルダの `licenses/` にあります。ビルドのときに自動で集め、出どころの分からないファイルが
+  あればビルドを止めます。
+- Ubuntu: Ubuntu 24.04 以降が対象です。上の「セットアップ」の Qt が使うシステムライブラリが必要です。
+
+手元で作るとき（作った OS の実行ファイルができます）:
+
+```bash
+uv sync --no-dev --group build
+uv run --no-dev --group build python packaging/build_release.py
+```
+
+`dist/` に圧縮ファイルができます。作った実行ファイルを画面なしで起動し、ファイルを開いて処理を実行できることまで確かめます。
 
 ## 解析コアの使い方
 
@@ -319,6 +347,11 @@ tests/
 ├── unit/                  # 単体テスト
 ├── integration/           # 結合テスト（保存と再オープン、取り込みから解析まで）
 └── gui/                   # GUI のテスト（pytest-qt。画面は出さない）
+packaging/
+├── build_release.py       # 配布用の実行ファイルを作る（ライセンス文書の同梱と起動の確認まで）
+├── launcher.py            # 実行ファイルの入口（--smoke-test で画面なしの起動の確認）
+├── ExperimentWorkbench.spec  # PyInstaller の設定（フォルダ形式、OS のライブラリは同梱しない）
+└── licenses/              # LGPL-3.0・GPL-3.0 の全文（PySide6 の wheel に含まれないため）
 ```
 
 計算・保存・時間軸の判定のコードは Qt に依存しません。GUI は `ui/` に分けています。
@@ -326,4 +359,4 @@ tests/
 
 ## 使用しているライブラリのライセンス
 
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) を参照してください。ライブラリを同梱した配布物を作るときの作業もここにあります。
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) を参照してください。Release の実行ファイルに同梱するときの作業もここにあります。

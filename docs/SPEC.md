@@ -63,7 +63,7 @@
 | データ永続化 | Parquet + SQLite | 数値列とメタデータを分離して保持 |
 | 設定・型検証 | Pydantic | インポート設定、解析手順、プロジェクト構造の検証 |
 | テスト・品質 | pytest / Ruff / mypy | Claude Codeによる改修で品質を維持 |
-| 配布 | 最初は `uv` で起動、後にPyInstaller等を評価 | 初期は実装と検証を優先 |
+| 配布 | 開発は `uv` で起動。配布はタグから GitHub Actions で Windows・Ubuntu の実行ファイル（PyInstaller、フォルダ形式）を作り、Release に載せる | 2026-11-10 にユーザー要望で前倒し（DECISIONS 参照） |
 
 PySide6 / PyQtGraphを第一候補とする。Tauri + TypeScriptは代替候補だが、v0.1時点ではPythonとのプロセス間連携の複雑さを増やさない方針。依存ライブラリのライセンスは確認済みで、結果は `THIRD_PARTY_NOTICES.md` にある（2026-11-06）。配布物を作るときは同文書の手順に従う。
 

@@ -1,13 +1,14 @@
 # 簡易 CI: Windows と Ubuntu で Lint・フォーマット・型チェック・テストを実行する（SPEC F-09）。
 # GUI のテスト（pytest-qt）は画面を出さない offscreen モードで実行する。
+# タグ（v*）の push では release.yml がこの検査を呼び出し、通ったときだけ実行ファイルを作る。
 name: CI
 
 on:
   push:
     branches: [master]
-    tags: [v*]
   pull_request:
     branches: [master]
+  workflow_call:
 
 jobs:
   check:
