@@ -1,6 +1,6 @@
 [project]
 name = "experiment-workbench"
-version = "0.1.0"
+version = "1.0.0"
 description = "研究実験の時系列データを読み込み・同期・比較・再現するための汎用ワークベンチ"
 readme = "README.md"
 requires-python = ">=3.12"
